@@ -2,6 +2,7 @@
 
 mod monolith;
 pub mod rate_limiter;
+pub mod oracle;
 
 pub mod access;
 pub mod packed_args;
@@ -130,6 +131,8 @@ pub enum Error {
 pub enum OracleProvider {
     Chainlink,
     Band,
+    Reflector,
+    Sep40,
 }
 
 #[contracttype]
