@@ -1,6 +1,5 @@
 #![no_std]
 
-mod monolith;
 pub mod rate_limiter;
 pub mod oracle;
 
