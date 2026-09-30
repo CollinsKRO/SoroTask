@@ -22,6 +22,7 @@ pub mod storage;
 pub mod task;
 pub mod admin;
 pub mod upgrade;
+pub mod security;
 
 pub use storage::{TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
@@ -1172,35 +1173,12 @@ pub enum DataKey {
     CrossChainSourceEnabled(u32),
 }
 
-/// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
-pub struct ReentrancyGuard<'a>(&'a Env);
-
-impl<'a> ReentrancyGuard<'a> {
-    pub fn new(env: &'a Env) -> Self {
-        enter_security_guard(env);
-        Self(env)
-    }
-}
-
-impl<'a> Drop for ReentrancyGuard<'a> {
-    fn drop(&mut self) {
-        exit_security_guard(self.0);
-    }
-}
-
 fn enter_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    if env.storage().temporary().has(&key) || env.storage().instance().has(&key) {
-        panic_with_error!(env, Error::ReentrantCall);
-    }
-    env.storage().temporary().set(&key, &true);
-    env.storage().instance().set(&key, &true);
+    security::enter(env);
 }
 
 fn exit_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    env.storage().temporary().remove(&key);
-    env.storage().instance().remove(&key);
+    security::exit(env);
 }
 
 /// Deterministic fingerprint for a task's identifying parameters, scoped per
@@ -4554,9 +4532,8 @@ impl SoroTaskContract {
     }
 
     pub fn execute(env: Env, keeper: Address, task_id: u64) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
     }
 
     /// Public permissionless entrypoint to bump task TTL with keeper incentive (Issue #1031)
@@ -4633,6 +4610,7 @@ impl SoroTaskContract {
         callback_fn: Symbol,
         callback_args: Vec<Val>,
     ) {
+        let _guard = security::ReentrancyGuard::new(&env);
         keeper.require_auth();
         extend_instance_ttl(&env);
         let task_key = DataKey::Task(task_id);
@@ -4656,9 +4634,7 @@ impl SoroTaskContract {
         }
 
         // Execute inner task execution atomically
-        enter_security_guard(&env);
         Self::execute_internal(&env, &keeper, task_id, true);
-        exit_security_guard(&env);
     }
 
     /// Verifies VDF proof difficulty and non-empty output integrity, ensuring un-cheatable
@@ -4675,12 +4651,11 @@ impl SoroTaskContract {
 
     /// Executes task after validating Verifiable Delay Function (VDF) proof.
     pub fn execute_with_vdf(env: Env, keeper: Address, task_id: u64, vdf_proof: VdfProof) -> bool {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         if !Self::verify_vdf_proof(env.clone(), vdf_proof, 100) {
             panic_with_error!(&env, Error::InvalidVdfProof);
         }
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
         true
     }
 
@@ -5642,7 +5617,7 @@ impl SoroTaskContract {
     /// Withdraws gas tokens from a task's balance.
     /// Only the task creator can withdraw.
     pub fn withdraw_gas(env: Env, task_id: u64, amount: i128) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let task_key = DataKey::Task(task_id);
         let mut config: TaskConfig = env
             .storage()
@@ -5683,12 +5658,11 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Cancels a task, refunds remaining gas, and removes it from storage.
     pub fn cancel_task(env: Env, task_id: u64) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let config: TaskConfig = load_task(&env, task_id).expect("Task not found");
 
         // Validate: Only creator can cancel
@@ -5749,7 +5723,6 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), refund_amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Permissionlessly refunds and removes an abandoned task (Issue #777).
@@ -8983,6 +8956,26 @@ pub(crate) mod tests {
         }
     }
 
+    /// Target that attempts to cancel another task during its callback.
+    #[contract]
+    pub struct ReentrantTarget;
+
+    #[contractimpl]
+    impl ReentrantTarget {
+        pub fn attempt_cancel(env: Env, contract_id: Address, task_id: u64) {
+            let client = SoroTaskContractClient::new(&env, &contract_id);
+            let rejected = client.try_cancel_task(&task_id).is_err();
+            env.storage().instance().set(&Symbol::new(&env, "reentry_rejected"), &rejected);
+        }
+
+        pub fn was_reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "reentry_rejected"))
+                .unwrap_or(false)
+        }
+    }
+
     // ── Resolver contracts (separate sub-modules) ───────────────────────
 
     /// Resolver that always approves execution.
@@ -9775,6 +9768,38 @@ pub(crate) mod tests {
         assert_eq!(stored.target, target);
         assert_eq!(stored.interval, 3_600);
         assert_eq!(stored.last_run, 0, "last_run must start at 0");
+    }
+
+    /// Reentry from an untrusted task callback is rejected while the outer
+    /// execution and ordinary target invocation complete successfully.
+    #[test]
+    fn test_malicious_target_cannot_reenter_cancel_task() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+        let keeper = Address::generate(&env);
+
+        let victim_target = env.register(MockTarget, ());
+        let victim_id = client.register(&base_config(&env, victim_target));
+
+        let attacker_target = env.register(ReentrantTarget, ());
+        let mut attacker_config = base_config(&env, attacker_target.clone());
+        attacker_config.function = Symbol::new(&env, "attempt_cancel");
+        attacker_config.args = vec![
+            &env,
+            id.clone().into_val(&env),
+            victim_id.into_val(&env),
+        ];
+        let attacker_id = client.register(&attacker_config);
+
+        set_timestamp(&env, 10_000);
+        client.execute(&keeper, &attacker_id);
+
+        let attacker_client = ReentrantTargetClient::new(&env, &attacker_target);
+        assert!(attacker_client.was_reentry_rejected());
+        assert!(client.get_task(&victim_id).is_some());
+
+        // A subsequent ordinary call remains possible after the guard drops.
+        client.execute(&keeper, &victim_id);
     }
 
     /// Querying a task id that was never registered returns None.
