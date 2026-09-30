@@ -4,11 +4,13 @@ const errorHandler = require('./errorHandler');
 const errorCodes = require('./errorCodes');
 const Monitor = require('./monitor');
 const { AbiCache } = require('./abiCache');
+const { TaskFlowGraph } = require('./taskFlowGraph');
 
 class ABIRegistryService {
   constructor(options = {}) {
     this.monitor = new Monitor(parser, registry);
     this.cache = options.cache || new AbiCache(options);
+    this.taskFlowGraph = new TaskFlowGraph();
     this.indexerEvents = null;
     if (options.indexerEvents) this.attachIndexerEvents(options.indexerEvents);
   }
@@ -33,6 +35,18 @@ class ABIRegistryService {
 
   getErrorCodes() {
     return errorCodes;
+  }
+
+  getTaskFlowGraph() {
+    return this.taskFlowGraph;
+  }
+
+  registerTaskFlow(graph) {
+    return this.taskFlowGraph.register(graph);
+  }
+
+  exportTaskFlowToRegisterParams(graph) {
+    return this.taskFlowGraph.toRegisterParams(graph);
   }
 
   decodeErrorCode(code) {
