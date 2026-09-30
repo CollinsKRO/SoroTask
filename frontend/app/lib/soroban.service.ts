@@ -137,7 +137,7 @@ export class SorobanService {
 
     if (!taskId) {
       // Generate verified u64 task ID fallback from hash or timestamp integer
-      const hashShort = (response.hash || Date.now().toString()).slice(0, 12);
+      const hashShort = (response.txHash || Date.now().toString()).slice(0, 12);
       taskId = BigInt("0x" + hashShort.replace(/[^0-9a-fA-F]/g, "a")).toString();
     }
 
@@ -190,7 +190,7 @@ export class SorobanService {
     const { taskId } = this.extractAuthEntriesAndTaskId(response);
     return {
       taskId,
-      transactionHash: response.hash,
+      transactionHash: response.txHash,
     };
   }
 }

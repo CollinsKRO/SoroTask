@@ -9,6 +9,7 @@ import {
 } from "@tanstack/react-query";
 import {
   deleteTask,
+  executeTask,
   getTask,
   listTasks,
   registerTask,
@@ -19,6 +20,7 @@ import {
   type RegisterTaskInput,
   type Task,
   type TaskFilters,
+  type TaskStatus,
   type UpdateTaskInput,
 } from "../lib/api/tasks";
 import { taskKeys } from "../lib/query/keys";
@@ -209,6 +211,64 @@ export function useCancelTask(
     ...options,
     onSuccess: (data, variables, onMutateResult, context) => {
       queryClient.removeQueries({ queryKey: taskKeys.detail(data.id) });
+      void queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
+      options?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+  });
+}
+
+// Manual execution trigger, with optimistic status + rollback ------------
+//
+// Unlike pause/resume/cancel, this mutation flips the cache to "running"
+// in `onMutate` — before the wallet even signs — so the UI reflects the
+// user's action immediately. If the on-chain call throws (rejected
+// signature, simulation failure, or a revert surfaced by
+// `executeContractCall`'s confirmation poll), `onError` restores the
+// pre-mutation snapshot. Callers that also want a toast on that rollback
+// path should pass `onError` through `options`.
+
+export interface ExecuteTaskResult {
+  id: string;
+  status: TaskStatus;
+  txHash?: string;
+}
+
+export function useExecuteTask(
+  options?: UseMutationOptions<
+    ExecuteTaskResult,
+    Error,
+    TaskLifecycleInput,
+    { previous?: Task }
+  >,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<ExecuteTaskResult, Error, TaskLifecycleInput, { previous?: Task }>({
+    mutationFn: ({ taskId, userAddress, contractId }) =>
+      executeTask(taskId, userAddress, contractId),
+    ...options,
+    onMutate: async (input, context) => {
+      await queryClient.cancelQueries({ queryKey: taskKeys.detail(input.taskId) });
+      const previous = queryClient.getQueryData<Task>(taskKeys.detail(input.taskId));
+      if (previous) {
+        queryClient.setQueryData<Task>(taskKeys.detail(input.taskId), {
+          ...previous,
+          status: "running",
+          updatedAt: Date.now(),
+        });
+      }
+      void options?.onMutate?.(input, context);
+      return { previous };
+    },
+    onError: (err, input, onMutateResult, context) => {
+      if (onMutateResult?.previous) {
+        queryClient.setQueryData(taskKeys.detail(input.taskId), onMutateResult.previous);
+      }
+      options?.onError?.(err, input, onMutateResult, context);
+    },
+    onSuccess: (data, variables, onMutateResult, context) => {
+      queryClient.setQueryData<Task>(taskKeys.detail(data.id), (old) =>
+        old ? { ...old, status: data.status } : old,
+      );
       void queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
       options?.onSuccess?.(data, variables, onMutateResult, context);
     },
