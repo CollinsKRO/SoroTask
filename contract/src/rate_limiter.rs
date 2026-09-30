@@ -57,24 +57,34 @@ pub fn allow_invocation(env: &Env, target: &Address) -> bool {
 #[cfg(test)]
 mod tests {
     use super::allow_invocation;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use crate::SoroTaskContract;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Env,
+    };
 
     #[test]
     fn limits_each_target_and_leaks_capacity_over_time() {
         let env = Env::default();
+        // `allow_invocation` touches contract storage, so the test must run
+        // inside a contract context via `as_contract`.
+        let contract_id = env.register(SoroTaskContract, ());
         let first = Address::generate(&env);
         let second = Address::generate(&env);
 
+        let call =
+            |target: &Address| env.as_contract(&contract_id, || allow_invocation(&env, target));
+
         for _ in 0..10 {
-            assert!(allow_invocation(&env, &first));
+            assert!(call(&first));
         }
-        assert!(!allow_invocation(&env, &first));
-        assert!(allow_invocation(&env, &second));
+        assert!(!call(&first));
+        assert!(call(&second));
 
         env.ledger().with_mut(|ledger| ledger.sequence_number += 10);
-        assert!(!allow_invocation(&env, &first));
+        assert!(!call(&first));
 
         env.ledger().with_mut(|ledger| ledger.sequence_number += 90);
-        assert!(allow_invocation(&env, &first));
+        assert!(call(&first));
     }
 }
