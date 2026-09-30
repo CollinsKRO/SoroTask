@@ -1,8 +1,8 @@
 #![no_std]
 
-pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
+pub mod rate_limiter;
 // Issue #777 investigation: this file previously declared
 // `pub mod access; pub mod execution; pub mod oracle; pub mod storage;
 // pub mod types; pub mod vrf; pub mod yield;` — none of those files
@@ -14,12 +14,13 @@ pub mod packed_args;
 // did. `events.rs` does exist and is kept, once.
 pub mod events;
 pub use events::*;
-pub mod math;
+pub mod admin;
 pub mod dag;
+pub mod math;
 pub mod storage;
 pub mod task;
-pub mod admin;
 pub mod upgrade;
+pub mod zk;
 
 pub use storage::{TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
@@ -1168,6 +1169,17 @@ pub enum DataKey {
     CrossChainTaskCounter,
     /// Cross-chain gateway: per-chain enabled flag
     CrossChainSourceEnabled(u32),
+    // -------------------------------------------------------------------------
+    // Groth16 ZK proof gate (Issue #1195)
+    // -------------------------------------------------------------------------
+    /// Stored 32-byte verification-key digest `SHA-256(α||β||γ||δ||IC)`.
+    ZkVerificationKey,
+    /// Spent-nullifier set; key = nullifier bytes, value = bool (true = spent).
+    ZkNullifier(BytesN<32>),
+    /// Sequential ZK proof record (audit log).
+    ZkProofRecord(u64),
+    /// Counter for ZK proof records.
+    ZkProofCounter,
 }
 
 /// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
@@ -1477,7 +1489,11 @@ fn set_total_unclaimed_fees(env: &Env, amount: i128) {
 }
 
 fn assert_balance_invariant(env: &Env) {
-    if let Some(token_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::Token) {
+    if let Some(token_address) = env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Token)
+    {
         let token_client = soroban_sdk::token::Client::new(env, &token_address);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let total_task_escrows = get_total_task_escrows(env);
@@ -2053,10 +2069,7 @@ impl SoroTaskContract {
             .get::<DataKey, EmergencyPauseState>(&DataKey::EmergencyPauseState)
         {
             if state.is_paused {
-                if env
-                    .ledger()
-                    .timestamp()
-                    >= state.paused_at.saturating_add(state.pause_duration)
+                if env.ledger().timestamp() >= state.paused_at.saturating_add(state.pause_duration)
                 {
                     state.is_paused = false;
                     env.storage()
@@ -2122,7 +2135,10 @@ impl SoroTaskContract {
         }
 
         if sigs.len() >= Self::pause_threshold(&env) {
-            let timelock = env.ledger().timestamp().saturating_add(UNPAUSE_TIMELOCK_SECONDS);
+            let timelock = env
+                .ledger()
+                .timestamp()
+                .saturating_add(UNPAUSE_TIMELOCK_SECONDS);
             env.storage()
                 .persistent()
                 .set(&DataKey::UnpauseTimelock, &timelock);
@@ -2293,7 +2309,8 @@ impl SoroTaskContract {
 
         config.is_active = true;
         if config.permissions == 0 {
-            config.permissions = PERM_CAN_PAUSE | PERM_CAN_UPDATE | PERM_CAN_CANCEL | PERM_CAN_DEPOSIT;
+            config.permissions =
+                PERM_CAN_PAUSE | PERM_CAN_UPDATE | PERM_CAN_CANCEL | PERM_CAN_DEPOSIT;
         }
         // Dependency edges must go through `add_dependency`/`add_dependency_with_rule`,
         // which enforce cycle detection and MAX_DEPENDENCY_DEPTH. A caller-supplied
@@ -2577,17 +2594,25 @@ impl SoroTaskContract {
     /// Sets the maximum allowable single-update oracle price volatility threshold in basis points (bps).
     pub fn set_max_volatility_bps(env: Env, admin: Address, max_bps: u32) {
         admin.require_auth();
-        env.storage().instance().set(&DataKey::MaxVolatilityBps, &max_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxVolatilityBps, &max_bps);
     }
 
     /// Returns the maximum volatility threshold in bps (default: 500 = 5%).
     pub fn get_max_volatility_bps(env: &Env) -> u32 {
-        env.storage().instance().get(&DataKey::MaxVolatilityBps).unwrap_or(500)
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxVolatilityBps)
+            .unwrap_or(500)
     }
 
     /// Checks if the volatility circuit breaker is currently tripped.
     pub fn is_volatility_circuit_tripped(env: &Env) -> bool {
-        env.storage().instance().get(&DataKey::VolatilityCircuitBreakerTripped).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::VolatilityCircuitBreakerTripped)
+            .unwrap_or(false)
     }
 
     /// Updates oracle price, checking single-update price delta against max_volatility_bps.
@@ -2600,7 +2625,11 @@ impl SoroTaskContract {
         }
 
         let max_volatility = Self::get_max_volatility_bps(&env);
-        if let Some(last_price) = env.storage().instance().get::<DataKey, i128>(&DataKey::LastOraclePrice) {
+        if let Some(last_price) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::LastOraclePrice)
+        {
             if last_price > 0 {
                 let diff = if new_price > last_price {
                     new_price - last_price
@@ -2609,9 +2638,13 @@ impl SoroTaskContract {
                 };
                 let volatility_bps = ((diff as u128 * 10_000) / last_price as u128) as u32;
                 if volatility_bps > max_volatility {
-                    env.storage().instance().set(&DataKey::VolatilityCircuitBreakerTripped, &true);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VolatilityCircuitBreakerTripped, &true);
                     let current_time = env.ledger().timestamp();
-                    env.storage().instance().set(&DataKey::VolatilityUnpauseTimelock, &(current_time + 3_600));
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VolatilityUnpauseTimelock, &(current_time + 3_600));
                     crate::events::EventLogger::log_oracle_volatility_breach(
                         &env,
                         last_price,
@@ -2625,7 +2658,9 @@ impl SoroTaskContract {
             }
         }
 
-        env.storage().instance().set(&DataKey::LastOraclePrice, &new_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastOraclePrice, &new_price);
         exit_security_guard(&env);
         Ok(false)
     }
@@ -2633,12 +2668,18 @@ impl SoroTaskContract {
     /// Unpauses the volatility circuit breaker after timelock expiration.
     pub fn unpause_volatility_breaker(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        if let Some(timelock) = env.storage().instance().get::<DataKey, u64>(&DataKey::VolatilityUnpauseTimelock) {
+        if let Some(timelock) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::VolatilityUnpauseTimelock)
+        {
             if env.ledger().timestamp() < timelock {
                 return Err(Error::VolatilityTimelockActive);
             }
         }
-        env.storage().instance().set(&DataKey::VolatilityCircuitBreakerTripped, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::VolatilityCircuitBreakerTripped, &false);
         crate::events::EventLogger::log_volatility_circuit_breaker_unpaused(&env, admin);
         Ok(())
     }
@@ -3000,10 +3041,8 @@ impl SoroTaskContract {
                 .persistent()
                 .get::<DataKey, OracleDataResponse>(&DataKey::OracleResponses(i))
             {
-                let request: Option<OracleDataRequest> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::OracleRequests(i));
+                let request: Option<OracleDataRequest> =
+                    env.storage().persistent().get(&DataKey::OracleRequests(i));
 
                 if let Some(req) = request {
                     if req.task_id == task_id && req.status == OracleRequestStatus::Fulfilled {
@@ -3026,12 +3065,7 @@ impl SoroTaskContract {
     // ============================================================================
 
     /// Sets or updates an oracle price feed entry for a given provider.
-    pub fn set_oracle_feed(
-        env: Env,
-        provider: OracleProvider,
-        price: i128,
-        decimals: u32,
-    ) {
+    pub fn set_oracle_feed(env: Env, provider: OracleProvider, price: i128, decimals: u32) {
         enter_security_guard(&env);
 
         let config: OracleConfig = env
@@ -3077,10 +3111,7 @@ impl SoroTaskContract {
     /// Returns the median price and the number of active feeds.
     /// Panics with `InsufficientOracleFeeds` if fewer than 1 feed is available.
     fn compute_median_price(env: &Env) -> (i128, u32) {
-        let providers = [
-            OracleProvider::Chainlink,
-            OracleProvider::Band,
-        ];
+        let providers = [OracleProvider::Chainlink, OracleProvider::Band];
 
         let mut prices: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
         let mut active_count: u32 = 0;
@@ -3135,10 +3166,7 @@ impl SoroTaskContract {
 
     /// Checks deviation between oracle feeds and halts if any pair exceeds `MAX_ORACLE_DEVIATION_BPS`.
     fn check_oracle_deviation(env: &Env) {
-        let providers = [
-            OracleProvider::Chainlink,
-            OracleProvider::Band,
-        ];
+        let providers = [OracleProvider::Chainlink, OracleProvider::Band];
 
         let mut prices: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
 
@@ -3277,7 +3305,9 @@ impl SoroTaskContract {
             .instance()
             .get(&DataKey::VrfExpirationSeconds)
             .unwrap_or(DEFAULT_VRF_EXPIRATION_SECONDS);
-        let expiration_time = request_time.saturating_add(delay).saturating_add(expiration);
+        let expiration_time = request_time
+            .saturating_add(delay)
+            .saturating_add(expiration);
         if delay > 0 && now < expiration_time {
             panic_with_error!(&env, Error::ChallengeWindowActive);
         }
@@ -3997,7 +4027,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::ValidateAuth, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::ValidateAuth,
+            StepResult::Passed,
+            0,
         );
 
         // ── 2. Load task (meta + payload via normalized storage) ───────────
@@ -4010,10 +4045,20 @@ impl SoroTaskContract {
                     detail: Error::TaskNotFound as u32,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::LoadTask, StepResult::Failed,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::LoadTask,
+                    StepResult::Failed,
                     Error::TaskNotFound as u32,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::TaskNotFound);
             }
         };
@@ -4023,7 +4068,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::LoadTask, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::LoadTask,
+            StepResult::Passed,
+            0,
         );
 
         // ── 3. Check invalidation hooks (Issue #832) ────────────────────
@@ -4032,9 +4082,18 @@ impl SoroTaskContract {
             save_task(env, task_id, &config);
             remove_active_task_id(env, task_id);
             events::EventLogger::log_task_invalidated(
-                env, task_id, config.target.clone(), hook.callback_fn.clone(),
+                env,
+                task_id,
+                config.target.clone(),
+                hook.callback_fn.clone(),
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::TaskPaused);
         }
 
@@ -4048,13 +4107,28 @@ impl SoroTaskContract {
             Ok(_) => {}
             Err(Error::BlockExecutionLimitReached) => {
                 events::EventLogger::log_rate_limit_exceeded(
-                    env, task_id, get_block_execution_count(env), max_per_block,
+                    env,
+                    task_id,
+                    get_block_execution_count(env),
+                    max_per_block,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Skipped);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Skipped,
+                );
                 return;
             }
             Err(_) => {
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::BlockExecutionLimitReached);
             }
         }
@@ -4067,10 +4141,20 @@ impl SoroTaskContract {
                 detail: Error::TaskPaused as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckActive, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckActive,
+                StepResult::Failed,
                 Error::TaskPaused as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::TaskPaused);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4079,7 +4163,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckActive, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckActive,
+            StepResult::Passed,
+            0,
         );
 
         // ── 4. Check whitelist ────────────────────────────────────────────
@@ -4090,10 +4179,20 @@ impl SoroTaskContract {
                 detail: Error::Unauthorized as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckWhitelist, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckWhitelist,
+                StepResult::Failed,
                 Error::Unauthorized as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::Unauthorized);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4102,7 +4201,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckWhitelist, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckWhitelist,
+            StepResult::Passed,
+            0,
         );
 
         Self::require_vrf_keeper_winner(env, task_id, keeper);
@@ -4115,7 +4219,13 @@ impl SoroTaskContract {
             .get(&DataKey::TaskRequiresBond(task_id))
             .unwrap_or(false);
         if task_requires_bond && !Self::is_keeper_bonded(env.clone(), keeper.clone()) {
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::KeeperNotBonded);
         }
 
@@ -4127,9 +4237,20 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckInterval, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckInterval,
+                StepResult::Skipped,
+                0,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Skipped);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Skipped,
+            );
             return;
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4138,7 +4259,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckInterval, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckInterval,
+            StepResult::Passed,
+            0,
         );
 
         // ── 6. Check dependencies ─────────────────────────────────────────
@@ -4149,10 +4275,20 @@ impl SoroTaskContract {
                 detail: Error::DependencyBlocked as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckDependencies, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckDependencies,
+                StepResult::Failed,
                 Error::DependencyBlocked as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::DependencyBlocked);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4161,7 +4297,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckDependencies, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckDependencies,
+            StepResult::Passed,
+            0,
         );
 
         // ── 7. Resolver gate ──────────────────────────────────────────────
@@ -4187,7 +4328,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::EvaluateResolver, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::EvaluateResolver,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4196,7 +4342,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::EvaluateResolver, StepResult::Failed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::EvaluateResolver,
+                StepResult::Failed,
+                0,
             );
         }
 
@@ -4237,7 +4388,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckVrfCondition, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckVrfCondition,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4246,14 +4402,25 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckVrfCondition, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckVrfCondition,
+                StepResult::Skipped,
+                0,
             );
         }
 
         // ── 8b. Oracle freshness & deviation check (Issues #1040, #1041) ──
         {
-            let has_oracle_feeds = env.storage().persistent().has(&DataKey::OracleFeed(OracleProvider::Chainlink))
-                || env.storage().persistent().has(&DataKey::OracleFeed(OracleProvider::Band));
+            let has_oracle_feeds = env
+                .storage()
+                .persistent()
+                .has(&DataKey::OracleFeed(OracleProvider::Chainlink))
+                || env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::OracleFeed(OracleProvider::Band));
 
             if has_oracle_feeds {
                 // Check freshness of all feeds
@@ -4280,10 +4447,20 @@ impl SoroTaskContract {
                         detail: Error::OracleStale as u32,
                     });
                     events::EventLogger::log_execution_step(
-                        env, task_id, keeper, events::ExecutionStep::CheckOracleFreshness,
-                        StepResult::Failed, Error::OracleStale as u32,
+                        env,
+                        task_id,
+                        keeper,
+                        events::ExecutionStep::CheckOracleFreshness,
+                        StepResult::Failed,
+                        Error::OracleStale as u32,
                     );
-                    Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                    Self::persist_execution_trace(
+                        env,
+                        task_id,
+                        keeper,
+                        trace_steps,
+                        ExecutionOutcome::Failed,
+                    );
                     panic_with_error!(env, Error::OracleStale);
                 }
 
@@ -4296,8 +4473,12 @@ impl SoroTaskContract {
                     detail: 0,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, events::ExecutionStep::CheckOracleFreshness,
-                    StepResult::Passed, 0,
+                    env,
+                    task_id,
+                    keeper,
+                    events::ExecutionStep::CheckOracleFreshness,
+                    StepResult::Passed,
+                    0,
                 );
             }
         }
@@ -4311,7 +4492,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckZkCondition, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckZkCondition,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4320,7 +4506,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckZkCondition, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckZkCondition,
+                StepResult::Skipped,
+                0,
             );
         }
 
@@ -4333,7 +4524,12 @@ impl SoroTaskContract {
                 detail: fee as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CalculateFee, StepResult::Passed, fee as u32,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CalculateFee,
+                StepResult::Passed,
+                fee as u32,
             );
 
             // ── 11. Balance check ────────────────────────────────────────
@@ -4344,10 +4540,20 @@ impl SoroTaskContract {
                     detail: Error::InsufficientBalance as u32,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::CheckBalance, StepResult::Failed,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::CheckBalance,
+                    StepResult::Failed,
                     Error::InsufficientBalance as u32,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::InsufficientBalance);
             }
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4356,7 +4562,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckBalance, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckBalance,
+                StepResult::Passed,
+                0,
             );
 
             // ── 12. Yield strategy execution ─────────────────────────────
@@ -4370,7 +4581,12 @@ impl SoroTaskContract {
                             detail: 0,
                         });
                         events::EventLogger::log_execution_step(
-                            env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Passed, 0,
+                            env,
+                            task_id,
+                            keeper,
+                            ExecutionStep::ExecuteYield,
+                            StepResult::Passed,
+                            0,
                         );
                         true
                     }
@@ -4381,10 +4597,20 @@ impl SoroTaskContract {
                             detail: Error::YieldHarvestFailed as u32,
                         });
                         events::EventLogger::log_execution_step(
-                            env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Failed,
+                            env,
+                            task_id,
+                            keeper,
+                            ExecutionStep::ExecuteYield,
+                            StepResult::Failed,
                             Error::YieldHarvestFailed as u32,
                         );
-                        Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                        Self::persist_execution_trace(
+                            env,
+                            task_id,
+                            keeper,
+                            trace_steps,
+                            ExecutionOutcome::Failed,
+                        );
                         panic_with_error!(env, Error::YieldHarvestFailed);
                     }
                 }
@@ -4395,7 +4621,12 @@ impl SoroTaskContract {
                     detail: 0,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Skipped, 0,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::ExecuteYield,
+                    StepResult::Skipped,
+                    0,
                 );
                 false
             };
@@ -4422,7 +4653,11 @@ impl SoroTaskContract {
                 detail: if executed_yield_strategy { 1 } else { 0 },
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CallTarget, StepResult::Passed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CallTarget,
+                StepResult::Passed,
                 if executed_yield_strategy { 1 } else { 0 },
             );
 
@@ -4433,8 +4668,8 @@ impl SoroTaskContract {
                 .get(&DataKey::ProtocolFeeBps)
                 .unwrap_or(0);
 
-            let (protocol_fee, keeper_fee) = math::split_execution_fee(fee, protocol_fee_bps)
-                .unwrap_or((0, fee));
+            let (protocol_fee, keeper_fee) =
+                math::split_execution_fee(fee, protocol_fee_bps).unwrap_or((0, fee));
 
             config.gas_balance -= fee;
             sub_total_task_escrows(env, fee);
@@ -4471,11 +4706,7 @@ impl SoroTaskContract {
                         &token_client,
                     );
                     if !routed {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            keeper,
-                            &keeper_fee,
-                        );
+                        token_client.transfer(&env.current_contract_address(), keeper, &keeper_fee);
                     }
                 }
                 assert_balance_invariant(env);
@@ -4486,7 +4717,12 @@ impl SoroTaskContract {
                 detail: fee as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::PayKeeper, StepResult::Passed, fee as u32,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::PayKeeper,
+                StepResult::Passed,
+                fee as u32,
             );
 
             // ── 15. Update state ─────────────────────────────────────────
@@ -4511,7 +4747,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::UpdateState, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::UpdateState,
+                StepResult::Passed,
+                0,
             );
 
             // Emit keeper paid event
@@ -4548,7 +4789,9 @@ impl SoroTaskContract {
             steps,
             final_outcome,
         };
-        env.storage().persistent().set(&DataKey::ExecutionTrace(task_id), &trace);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExecutionTrace(task_id), &trace);
     }
 
     pub fn execute(env: Env, keeper: Address, task_id: u64) {
@@ -4565,7 +4808,11 @@ impl SoroTaskContract {
             panic_with_error!(&env, Error::TaskNotFound);
         }
         extend_persistent_ttl(&env, &key);
-        if env.storage().persistent().has(&DataKey::TaskStatus(task_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TaskStatus(task_id))
+        {
             extend_persistent_ttl(&env, &DataKey::TaskStatus(task_id));
         }
     }
@@ -4611,11 +4858,7 @@ impl SoroTaskContract {
 
         if new_tier > old_tier {
             events::EventLogger::log_fee_discount_tier_updated(
-                env,
-                user,
-                old_tier,
-                new_tier,
-                new_count,
+                env, user, old_tier, new_tier, new_count,
             );
         }
     }
@@ -4644,7 +4887,8 @@ impl SoroTaskContract {
         }
 
         // Perform callback invocation with capital loan
-        let _callback_res = env.invoke_contract::<Val>(&callback_target, &callback_fn, callback_args);
+        let _callback_res =
+            env.invoke_contract::<Val>(&callback_target, &callback_fn, callback_args);
 
         // Verify loan repayment + fee condition
         let fee_bps: i128 = 30; // 0.3% flash loan fee
@@ -4693,7 +4937,8 @@ impl SoroTaskContract {
         let elapsed = now.saturating_sub(config.last_run);
         // Annual inflation adjustment: base * (1 + (elapsed * cpi_rate_bps) / (31_536_000 * 10_000))
         let base_bounty = FIXED_EXECUTION_FEE;
-        let inflation_delta = (base_bounty * elapsed as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
+        let inflation_delta =
+            (base_bounty * elapsed as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
         base_bounty + inflation_delta
     }
 
@@ -4706,18 +4951,27 @@ impl SoroTaskContract {
             None => panic_with_error!(&env, Error::TaskNotFound),
         };
 
-        let interval = if config.interval == 0 { 3600 } else { config.interval as u64 };
+        let interval = if config.interval == 0 {
+            3600
+        } else {
+            config.interval as u64
+        };
         let six_months_seconds: u64 = 15_768_000; // 182.5 days
         let expected_runs = six_months_seconds / interval;
         let base_bounty = FIXED_EXECUTION_FEE;
-        let inflation_delta = (base_bounty * six_months_seconds as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
+        let inflation_delta = (base_bounty * six_months_seconds as i128 * cpi_rate_bps as i128)
+            / (31_536_000 * 10_000);
         let adjusted_fee = base_bounty + inflation_delta;
         let required_escrow = expected_runs as i128 * adjusted_fee;
 
         let is_healthy = config.gas_balance >= required_escrow;
         if !is_healthy {
             env.events().publish(
-                (Symbol::new(&env, "BountyEscrowLow"), Symbol::new(&env, "v1"), task_id),
+                (
+                    Symbol::new(&env, "BountyEscrowLow"),
+                    Symbol::new(&env, "v1"),
+                    task_id,
+                ),
                 (config.gas_balance, required_escrow),
             );
         }
@@ -4736,7 +4990,9 @@ impl SoroTaskContract {
         // NOTE: We intentionally do not require init to set fee recipient to keep backward compatibility.
         // protocol_fee_bps defaults to 0.
         if !env.storage().instance().has(&DataKey::ProtocolFeeBps) {
-            env.storage().instance().set(&DataKey::ProtocolFeeBps, &0u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeeBps, &0u32);
         }
 
         // Emit initialized event
@@ -4768,7 +5024,11 @@ impl SoroTaskContract {
     /// Validates whether the global balance invariant holds:
     /// contract_balance >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees
     pub fn check_balance_invariant(env: Env) -> bool {
-        if let Some(token_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::Token) {
+        if let Some(token_address) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Token)
+        {
             let token_client = soroban_sdk::token::Client::new(&env, &token_address);
             let contract_balance = token_client.balance(&env.current_contract_address());
             let total_task_escrows = get_total_task_escrows(&env);
@@ -4791,7 +5051,9 @@ impl SoroTaskContract {
             .expect("Admin not initialized");
         admin.require_auth();
 
-        env.storage().instance().set(&DataKey::FeeRecipient, &recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &recipient);
 
         env.events().publish(
             (
@@ -4980,7 +5242,10 @@ impl SoroTaskContract {
             .set(&DataKey::EncryptedPayload(task_id), &payload);
 
         events::EventLogger::log_encrypted_params_registered(
-            &env, task_id, payload.encryption_scheme.clone(), payload.public_key.clone(),
+            &env,
+            task_id,
+            payload.encryption_scheme.clone(),
+            payload.public_key.clone(),
         );
 
         exit_security_guard(&env);
@@ -5053,7 +5318,11 @@ impl SoroTaskContract {
         update_keeper_total_delegated(&env, &keeper, amount);
 
         events::EventLogger::log_delegation_pool_event(
-            &env, delegator.clone(), keeper.clone(), amount, pool.commission_rate,
+            &env,
+            delegator.clone(),
+            keeper.clone(),
+            amount,
+            pool.commission_rate,
             Symbol::new(&env, "delegate"),
         );
 
@@ -5104,7 +5373,11 @@ impl SoroTaskContract {
         assert_balance_invariant(&env);
 
         events::EventLogger::log_delegation_pool_event(
-            &env, delegator.clone(), keeper, amount, pool.commission_rate,
+            &env,
+            delegator.clone(),
+            keeper,
+            amount,
+            pool.commission_rate,
             Symbol::new(&env, "undelegate"),
         );
 
@@ -5203,7 +5476,11 @@ impl SoroTaskContract {
             .get(&DataKey::Token)
             .expect("Token not initialized");
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        token_client.transfer(&env.current_contract_address(), &keeper, &bond.bonded_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &keeper,
+            &bond.bonded_amount,
+        );
 
         env.storage()
             .persistent()
@@ -5236,9 +5513,7 @@ impl SoroTaskContract {
 
     /// Returns the keeper's bond status.
     pub fn get_keeper_bond(env: Env, keeper: Address) -> Option<KeeperBond> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::KeeperBond(keeper))
+        env.storage().persistent().get(&DataKey::KeeperBond(keeper))
     }
 
     /// Slashes a keeper's stake and redistributes according to Issue #1043:
@@ -5246,7 +5521,13 @@ impl SoroTaskContract {
     /// - 50% awarded to the whistleblower (caller submitting valid fraud proof).
     /// - Slashed keeper is locked from participating until stake is replenished.
     /// Only callable by an authorized slasher (e.g., admin or fraud proof oracle).
-    pub fn slash_keeper(env: Env, admin: Address, keeper: Address, slash_amount: i128, whistleblower: Address) {
+    pub fn slash_keeper(
+        env: Env,
+        admin: Address,
+        keeper: Address,
+        slash_amount: i128,
+        whistleblower: Address,
+    ) {
         enter_security_guard(&env);
         admin.require_auth();
 
@@ -5400,7 +5681,6 @@ impl SoroTaskContract {
             .get(&DataKey::TaskRequiresBond(task_id))
             .unwrap_or(false)
     }
-
 
     /// Initializes the contract for Soroban-native proxy upgrades.
     pub fn init_proxy(env: Env, admin: Address, token: Address, version: u32) {
@@ -5865,7 +6145,11 @@ impl SoroTaskContract {
             creator: existing.creator,
             gas_balance: existing.gas_balance,
             last_run: existing.last_run,
-            permissions: if new_config.permissions != 0 { new_config.permissions } else { existing.permissions },
+            permissions: if new_config.permissions != 0 {
+                new_config.permissions
+            } else {
+                existing.permissions
+            },
             ..new_config
         };
 
@@ -5926,7 +6210,9 @@ impl SoroTaskContract {
         };
         let key = DataKey::KeeperPayoutPreference(keeper);
         env.storage().persistent().set(&key, &pref);
-        env.storage().persistent().extend_ttl(&key, 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 100_000);
     }
 
     /// Removes the calling keeper's payout routing preference, reverting
@@ -5981,8 +6267,8 @@ impl SoroTaskContract {
             _ => return false,
         };
 
-        let quote_args: Vec<Val> = (gas_token.clone(), pref.payout_token.clone(), amount)
-            .into_val(env);
+        let quote_args: Vec<Val> =
+            (gas_token.clone(), pref.payout_token.clone(), amount).into_val(env);
         let expected_out: i128 = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &pref.router,
             &Symbol::new(env, "get_amount_out"),
@@ -6052,7 +6338,12 @@ impl SoroTaskContract {
                 // back its own state changes), but revoke the approval
                 // defensively in case the router is still live for the rest
                 // of this ledger.
-                token_client.approve(&env.current_contract_address(), &pref.router, &0, &expiration_ledger);
+                token_client.approve(
+                    &env.current_contract_address(),
+                    &pref.router,
+                    &0,
+                    &expiration_ledger,
+                );
                 false
             }
         }
@@ -6111,7 +6402,9 @@ impl SoroTaskContract {
             resolved: false,
         };
         env.storage().persistent().set(&claim_key, &claim);
-        env.storage().persistent().extend_ttl(&claim_key, 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .extend_ttl(&claim_key, 100_000, 100_000);
 
         env.events().publish(
             (
@@ -6141,7 +6434,9 @@ impl SoroTaskContract {
         if claim.resolved {
             panic_with_error!(&env, Error::NoOptimisticClaim);
         }
-        if env.ledger().sequence() >= claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS {
+        if env.ledger().sequence()
+            >= claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS
+        {
             panic_with_error!(&env, Error::ChallengeWindowClosed);
         }
 
@@ -6218,7 +6513,8 @@ impl SoroTaskContract {
         if claim.resolved {
             panic_with_error!(&env, Error::NoOptimisticClaim);
         }
-        if env.ledger().sequence() < claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS {
+        if env.ledger().sequence() < claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS
+        {
             panic_with_error!(&env, Error::ChallengeWindowActive);
         }
 
@@ -6264,7 +6560,9 @@ impl SoroTaskContract {
     /// the last execution attempt, including which conditions passed
     /// or failed and the exact error codes.
     pub fn get_execution_trace(env: Env, task_id: u64) -> Option<ExecutionTrace> {
-        env.storage().persistent().get(&DataKey::ExecutionTrace(task_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutionTrace(task_id))
     }
 
     pub fn get_dependency_rules(env: Env, task_id: u64) -> Vec<DependencyRule> {
@@ -7749,13 +8047,7 @@ impl SoroTaskContract {
     }
 
     /// Entrypoint to vote on governance proposals.
-    pub fn vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        vote_for: bool,
-        voting_power: i128,
-    ) {
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, vote_for: bool, voting_power: i128) {
         Self::vote_on_proposal(env, voter, proposal_id, vote_for, voting_power);
     }
 
@@ -8226,7 +8518,8 @@ impl SoroTaskContract {
 
         if task.interval > 0 && time_elapsed > task.interval as u64 {
             let overdue = time_elapsed - task.interval as u64;
-            let bonus_bps = (((overdue as u128 * 10_000) / task.interval as u128).min(20_000)) as u32;
+            let bonus_bps =
+                (((overdue as u128 * 10_000) / task.interval as u128).min(20_000)) as u32;
             return base_fee + ((base_fee * bonus_bps as i128) / 10_000);
         }
 
@@ -8531,11 +8824,7 @@ impl SoroTaskContract {
         env.crypto()
             .ed25519_verify(&public_key, &payload, &signature);
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Counter)
-            .unwrap_or(0);
+        let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap_or(0);
         let task_id = counter + 1;
 
         if task_config.interval == 0 {
@@ -8623,10 +8912,7 @@ impl SoroTaskContract {
     }
 
     /// Configures target reserve and returns updated solvency report.
-    pub fn auto_balance_insurance_vault(
-        env: Env,
-        target_reserve: i128,
-    ) -> InsuranceSolvencyReport {
+    pub fn auto_balance_insurance_vault(env: Env, target_reserve: i128) -> InsuranceSolvencyReport {
         enter_security_guard(&env);
         env.storage()
             .instance()
@@ -8928,6 +9214,53 @@ impl SoroTaskContract {
         }
         Self::_is_cross_chain_nonce_used(&env, chain_id, nonce)
     }
+
+    // =========================================================================
+    // Groth16 Zero-Knowledge Proof Gate (Issue #1195)
+    // =========================================================================
+
+    /// Store (or update) the Groth16 verification-key digest for the ZK gate.
+    ///
+    /// `vk_digest` is `SHA-256(α_bytes || β_bytes || γ_bytes || δ_bytes || IC_bytes)`.
+    /// Only the contract admin may call this.
+    ///
+    /// # Arguments
+    /// * `env`       – Soroban environment.
+    /// * `admin`     – Admin address (must be the stored admin).
+    /// * `vk_digest` – 32-byte SHA-256 digest of the full verification key.
+    pub fn set_zk_verification_key(env: Env, admin: Address, vk_digest: BytesN<32>) {
+        enter_security_guard(&env);
+        admin.require_auth();
+        crate::zk::store_verification_key(&env, vk_digest);
+        exit_security_guard(&env);
+    }
+
+    /// Return the stored ZK verification-key digest, if any.
+    pub fn get_zk_verification_key(env: Env) -> Option<BytesN<32>> {
+        crate::zk::get_verification_key(&env)
+    }
+
+    /// Check whether a proof nullifier has already been spent.
+    ///
+    /// Returns `true` if the nullifier is in the spent-set (replay attempted).
+    pub fn is_zk_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        crate::zk::is_nullifier_spent(&env, &nullifier)
+    }
+
+    /// Execute a task gated behind a Groth16 ZK proof (Issue #1195).
+    ///
+    /// Valid proofs approve task execution; forged proofs or replayed nullifiers
+    /// are rejected with [`Error::InvalidZkProof`].
+    ///
+    /// # Arguments
+    /// * `env`     – Soroban environment.
+    /// * `task_id` – ID of the task to trigger.
+    /// * `proof`   – [`zk::Groth16Proof`] authorising execution.
+    pub fn execute_zk(env: Env, task_id: u64, proof: crate::zk::Groth16Proof) {
+        enter_security_guard(&env);
+        crate::zk::execute_zk(&env, task_id, proof);
+        exit_security_guard(&env);
+    }
 }
 
 // ============================================================================
@@ -8936,6 +9269,9 @@ impl SoroTaskContract {
 
 #[cfg(test)]
 mod test_gas;
+
+#[cfg(test)]
+mod test_zk;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -10012,7 +10348,10 @@ pub(crate) mod tests {
             .steps
             .iter()
             .find(|s| s.step == events::ExecutionStep::CallTarget);
-        assert!(target_step.is_none(), "target should not be called when resolver denied");
+        assert!(
+            target_step.is_none(),
+            "target should not be called when resolver denied"
+        );
     }
 
     /// When a task is paused, the execution panics. In Soroban, panics revert
@@ -10038,7 +10377,10 @@ pub(crate) mod tests {
 
         // The trace is NOT persisted because the panic reverts storage
         let trace = client.get_execution_trace(&task_id);
-        assert!(trace.is_none(), "trace should NOT exist - panic reverted storage");
+        assert!(
+            trace.is_none(),
+            "trace should NOT exist - panic reverted storage"
+        );
     }
 
     /// When the interval hasn't elapsed, the trace shows Skipped and
@@ -10441,7 +10783,12 @@ pub(crate) mod tests {
         };
 
         let result = client.try_register(&config);
-        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(Error::InvalidInterval as u32))));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::InvalidInterval as u32
+            )))
+        );
     }
 
     #[test]
@@ -10645,7 +10992,12 @@ pub(crate) mod tests {
 
         set_timestamp(&env, 12_345);
         let result = client.try_execute(&unauthorized_keeper, &task_id);
-        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(Error::Unauthorized as u32))));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::Unauthorized as u32
+            )))
+        );
     }
 
     #[test]
@@ -10740,8 +11092,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -10805,8 +11156,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -10856,8 +11206,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -10966,7 +11315,6 @@ pub(crate) mod tests {
         assert_eq!(token_client.balance(&fee_recipient), 5);
         assert_eq!(token_client.balance(&keeper), 95);
     }
-
 
     /// Test that execution fails if gas_balance is insufficient for the fee.
     #[test]
@@ -11823,7 +12171,10 @@ pub(crate) mod tests {
         let status = client.get_task_status(&task_id);
         assert_eq!(status.outcome, ExecutionOutcome::Success);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 3_600);
-        assert!(token_client.balance(&keeper) > 0, "keeper should have been paid");
+        assert!(
+            token_client.balance(&keeper) > 0,
+            "keeper should have been paid"
+        );
     }
 
     #[test]
@@ -12204,14 +12555,7 @@ pub(crate) mod tests {
         let commitment = BytesN::from_array(&env, &[1u8; 32]);
         let proof = Bytes::from_slice(&env, &[10, 20, 30, 40]);
 
-        client.submit_zk_range_proof(
-            &101u64,
-            &100i128,
-            &500i128,
-            &commitment,
-            &proof,
-            &verifier,
-        );
+        client.submit_zk_range_proof(&101u64, &100i128, &500i128, &commitment, &proof, &verifier);
 
         assert!(!client.is_zk_range_proof_satisfied(&101u64));
 
@@ -12325,7 +12669,10 @@ pub(crate) mod tests {
 
         // Test vote delegation
         client.delegate_vote(&delegator, &delegatee);
-        assert_eq!(client.get_vote_delegate(&delegator), Some(delegatee.clone()));
+        assert_eq!(
+            client.get_vote_delegate(&delegator),
+            Some(delegatee.clone())
+        );
 
         // Test propose parameter change
         let title = Bytes::from_slice(&env, b"Param Change Proposal");
@@ -12365,7 +12712,10 @@ pub(crate) mod tests {
         cfg.permissions = PERM_CAN_PAUSE;
 
         let task_id = client.register(&cfg);
-        assert_eq!(client.get_task(&task_id).unwrap().permissions, PERM_CAN_PAUSE);
+        assert_eq!(
+            client.get_task(&task_id).unwrap().permissions,
+            PERM_CAN_PAUSE
+        );
 
         // Pause should succeed since PERM_CAN_PAUSE (1) is set
         client.pause_task(&task_id);
@@ -12585,8 +12935,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_challenge_optimistic_result_slashes_dishonest_keeper() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         let token_address = client.get_token();
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
 
@@ -12608,8 +12957,7 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "Error(Contract, #50)")]
     fn test_challenge_optimistic_result_reverts_when_claim_is_honest() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysTrue);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysTrue);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         let challenger = Address::generate(&env);
         client.challenge_optimistic_result(&challenger, &task_id);
@@ -12618,8 +12966,7 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "Error(Contract, #48)")]
     fn test_challenge_optimistic_result_after_window_reverts() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         env.ledger()
             .with_mut(|l| l.sequence_number += OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS);

@@ -331,22 +331,13 @@ impl EventLogger {
             timestamp,
         };
 
-        let topics = (
-            Symbol::new(env, "Auth"),
-            Symbol::new(env, "Access"),
-            actor,
-        );
+        let topics = (Symbol::new(env, "Auth"), Symbol::new(env, "Access"), actor);
         env.events().publish(topics, event_data);
     }
 
     /// Logs a task invalidation event when an upstream protocol upgrade
     /// causes a registered task to become invalid.
-    pub fn log_task_invalidated(
-        env: &Env,
-        task_id: u64,
-        target_contract: Address,
-        reason: Symbol,
-    ) {
+    pub fn log_task_invalidated(env: &Env, task_id: u64, target_contract: Address, reason: Symbol) {
         let timestamp = env.ledger().timestamp();
         let event_data = TaskInvalidatedEvent {
             task_id,
@@ -429,11 +420,7 @@ impl EventLogger {
             timestamp,
         };
 
-        let topics = (
-            Symbol::new(env, "Stake"),
-            action,
-            keeper,
-        );
+        let topics = (Symbol::new(env, "Stake"), action, keeper);
         env.events().publish(topics, event_data);
     }
 
@@ -462,10 +449,7 @@ impl EventLogger {
 
     pub fn log_volatility_circuit_breaker_unpaused(env: &Env, admin: Address) {
         let timestamp = env.ledger().timestamp();
-        let event_data = VolatilityCircuitBreakerUnpausedEvent {
-            admin,
-            timestamp,
-        };
+        let event_data = VolatilityCircuitBreakerUnpausedEvent { admin, timestamp };
 
         let topics = (
             Symbol::new(env, "sorotask"),
