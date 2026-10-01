@@ -275,6 +275,13 @@ const DEFAULT_VRF_DELAY_SECONDS: u64 = 0;
 /// Default expiration seconds for VRF fulfillment window (Issue #1042). Admin can override.
 /// Defaults to 0 (disabled) to preserve backward compatibility.
 const DEFAULT_VRF_EXPIRATION_SECONDS: u64 = 0;
+const VRF_EXCLUSIVE_WINDOW_LEDGERS: u32 = 5;
+const STAKING_REWARD_PRECISION: i128 = 1_000_000_000_000;
+const BRONZE_EFFECTIVE_STAKE: i128 = 1_000;
+const SILVER_EFFECTIVE_STAKE: i128 = 10_000;
+const GOLD_EFFECTIVE_STAKE: i128 = 100_000;
+const MAX_LOCKUP_MULTIPLIER_BPS: i128 = 20_000;
+const MAX_LOCKUP_DURATION_SECONDS: u64 = 365 * 24 * 60 * 60;
 
 /// Minimum stake a keeper must bond to claim restricted tasks (Issue #1043), in token units.
 const MIN_KEEPER_STAKE: i128 = 500;
@@ -728,6 +735,15 @@ pub struct StakingBalance {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct StakingMetrics {
+    pub cumulative_stake_seconds: i128,
+    pub tracking_started_at: u64,
+    pub last_updated_at: u64,
+    pub lockup_started_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct GovernanceProposal {
     pub proposer: Address,
     pub title: Bytes,
@@ -1053,6 +1069,10 @@ pub enum DataKey {
     PortfolioCounter,
     StakingPool,
     StakingBalance(Address),
+    StakingMetrics(Address),
+    StakingRewardPerToken,
+    StakingRewardPerTokenPaid(Address),
+    StakingRewardReserve,
     GovernanceProposal(u64),
     GovernanceProposalCounter,
     GovernanceVotingPower(Address),
@@ -4323,7 +4343,20 @@ impl SoroTaskContract {
 
         if zk_passed {
             // ── 10. Fee calculation ─────────────────────────────────────
-            let fee: i128 = Self::calculate_execution_fee(env, &config);
+            let calculated_fee = Self::calculate_execution_fee(env, &config);
+            let protocol_fee_bps: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0);
+            let (gross_protocol_fee, keeper_fee) =
+                math::split_execution_fee(calculated_fee, protocol_fee_bps)
+                    .unwrap_or((0, calculated_fee));
+            let discount_bps = Self::staking_fee_discount_bps(env, &config.creator) as i128;
+            let protocol_fee_discount =
+                gross_protocol_fee.saturating_mul(discount_bps) / 10_000;
+            let protocol_fee = gross_protocol_fee.saturating_sub(protocol_fee_discount);
+            let fee = calculated_fee.saturating_sub(protocol_fee_discount);
             trace_steps.push_back(events::ExecutionStepRecord {
                 step: ExecutionStep::CalculateFee,
                 result: StepResult::Passed,
@@ -4424,15 +4457,6 @@ impl SoroTaskContract {
             );
 
             // ── 14. Pay keeper (Fee split: protocol fee -> fee_recipient, remainder -> keeper/delegators) ─
-            let protocol_fee_bps: u32 = env
-                .storage()
-                .instance()
-                .get(&DataKey::ProtocolFeeBps)
-                .unwrap_or(0);
-
-            let (protocol_fee, keeper_fee) = math::split_execution_fee(fee, protocol_fee_bps)
-                .unwrap_or((0, fee));
-
             config.gas_balance -= fee;
             sub_total_task_escrows(env, fee);
 
@@ -4444,7 +4468,28 @@ impl SoroTaskContract {
                     .expect("Not initialized");
                 let token_client = soroban_sdk::token::Client::new(env, &token_address);
 
-                if protocol_fee > 0 {
+                let staking_reward = protocol_fee * 20 / 100;
+                if staking_reward > 0 {
+                    let reserve: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::StakingRewardReserve)
+                        .unwrap_or(0);
+                    env.storage().instance().set(
+                        &DataKey::StakingRewardReserve,
+                        &reserve.saturating_add(staking_reward),
+                    );
+                    let total_staked = env
+                        .storage()
+                        .instance()
+                        .get::<DataKey, StakingPool>(&DataKey::StakingPool)
+                        .map(|pool| pool.total_staked)
+                        .unwrap_or(0);
+                    Self::distribute_staking_reward_reserve(env, total_staked);
+                }
+
+                let protocol_fee_after_rewards = protocol_fee - staking_reward;
+                if protocol_fee_after_rewards > 0 {
                     let fee_recipient: Address = env
                         .storage()
                         .instance()
@@ -4453,7 +4498,7 @@ impl SoroTaskContract {
                     token_client.transfer(
                         &env.current_contract_address(),
                         &fee_recipient,
-                        &protocol_fee,
+                        &protocol_fee_after_rewards,
                     );
                 }
 
@@ -7350,6 +7395,168 @@ impl SoroTaskContract {
             })
     }
 
+    fn update_staking_metrics(
+        env: &Env,
+        staker: &Address,
+        amount_before_change: i128,
+        reset: bool,
+    ) {
+        let now = env.ledger().timestamp();
+        let mut metrics = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingMetrics>(&DataKey::StakingMetrics(staker.clone()))
+            .unwrap_or(StakingMetrics {
+                cumulative_stake_seconds: 0,
+                tracking_started_at: now,
+                last_updated_at: now,
+                lockup_started_at: now,
+            });
+
+        if reset {
+            metrics = StakingMetrics {
+                cumulative_stake_seconds: 0,
+                tracking_started_at: now,
+                last_updated_at: now,
+                lockup_started_at: now,
+            };
+        } else {
+            let elapsed = now.saturating_sub(metrics.last_updated_at);
+            metrics.cumulative_stake_seconds = metrics
+                .cumulative_stake_seconds
+                .saturating_add(amount_before_change.saturating_mul(elapsed as i128));
+            metrics.last_updated_at = now;
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingMetrics(staker.clone()), &metrics);
+    }
+
+    fn effective_stake(env: &Env, staker: &Address) -> i128 {
+        let Some(balance) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(staker.clone()))
+        else {
+            return 0;
+        };
+        if balance.amount <= 0 {
+            return 0;
+        }
+
+        let now = env.ledger().timestamp();
+        let metrics = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingMetrics>(&DataKey::StakingMetrics(staker.clone()));
+        let (time_weighted_stake, lockup_started_at) = match metrics {
+            Some(metrics) => {
+                let elapsed = now.saturating_sub(metrics.tracking_started_at);
+                let pending_seconds = now.saturating_sub(metrics.last_updated_at);
+                let weighted = metrics
+                    .cumulative_stake_seconds
+                    .saturating_add(balance.amount.saturating_mul(pending_seconds as i128));
+                let average = if elapsed == 0 {
+                    balance.amount
+                } else {
+                    weighted / elapsed as i128
+                };
+                (average.min(balance.amount), metrics.lockup_started_at)
+            }
+            None => (balance.amount, balance.last_stake_timestamp),
+        };
+
+        let lockup_seconds = now
+            .saturating_sub(lockup_started_at)
+            .min(MAX_LOCKUP_DURATION_SECONDS);
+        let lockup_multiplier_bps = 10_000i128
+            + (lockup_seconds as i128 * (MAX_LOCKUP_MULTIPLIER_BPS - 10_000)
+                / MAX_LOCKUP_DURATION_SECONDS as i128);
+        time_weighted_stake.saturating_mul(lockup_multiplier_bps) / 10_000
+    }
+
+    fn staking_fee_discount_bps(env: &Env, staker: &Address) -> u32 {
+        let effective_stake = Self::effective_stake(env, staker);
+        if effective_stake >= GOLD_EFFECTIVE_STAKE {
+            5_000
+        } else if effective_stake >= SILVER_EFFECTIVE_STAKE {
+            2_500
+        } else if effective_stake >= BRONZE_EFFECTIVE_STAKE {
+            1_000
+        } else {
+            0
+        }
+    }
+
+    fn accrue_staking_rewards(env: &Env, staker: &Address, balance: &mut StakingBalance) {
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(balance.last_stake_timestamp);
+        let reward_rate = env
+            .storage()
+            .instance()
+            .get::<DataKey, StakingPool>(&DataKey::StakingPool)
+            .map(|pool| pool.reward_rate)
+            .unwrap_or(0);
+        let time_reward = balance
+            .amount
+            .saturating_mul(reward_rate)
+            .saturating_mul(elapsed as i128)
+            / 1_000_000;
+        balance.accumulated_rewards = balance.accumulated_rewards.saturating_add(time_reward);
+        balance.last_stake_timestamp = now;
+
+        let reward_per_token: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingRewardPerToken)
+            .unwrap_or(0);
+        let paid: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingRewardPerTokenPaid(staker.clone()))
+            .unwrap_or(0);
+        let delta = reward_per_token.saturating_sub(paid);
+        if delta > 0 && balance.amount > 0 {
+            balance.accumulated_rewards = balance
+                .accumulated_rewards
+                .saturating_add(balance.amount.saturating_mul(delta) / STAKING_REWARD_PRECISION);
+        }
+        env.storage().persistent().set(
+            &DataKey::StakingRewardPerTokenPaid(staker.clone()),
+            &reward_per_token,
+        );
+    }
+
+    fn distribute_staking_reward_reserve(env: &Env, total_staked: i128) {
+        let mut reserve: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingRewardReserve)
+            .unwrap_or(0);
+        if reserve > 0 && total_staked > 0 {
+            let increment = reserve.saturating_mul(STAKING_REWARD_PRECISION) / total_staked;
+            if increment > 0 {
+                let distributed = (increment.saturating_mul(total_staked)
+                    / STAKING_REWARD_PRECISION)
+                    .min(reserve);
+                reserve -= distributed;
+                let reward_per_token: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::StakingRewardPerToken)
+                    .unwrap_or(0);
+                env.storage().instance().set(
+                    &DataKey::StakingRewardPerToken,
+                    &reward_per_token.saturating_add(increment),
+                );
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::StakingRewardReserve, &reserve);
+    }
+
     /// Initializes the staking pool.
     pub fn init_staking_pool(env: Env, reward_rate: i128) {
         enter_security_guard(&env);
@@ -7381,6 +7588,9 @@ impl SoroTaskContract {
     pub fn stake_tokens(env: Env, staker: Address, amount: i128) {
         enter_security_guard(&env);
         staker.require_auth();
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
 
         // Validate staking pool is initialized
         let pool: StakingPool = env
@@ -7414,8 +7624,36 @@ impl SoroTaskContract {
                 accumulated_rewards: 0,
             });
 
+        Self::accrue_staking_rewards(&env, &staker, &mut staking_balance);
+        let first_stake = staking_balance.amount == 0;
+        Self::update_staking_metrics(&env, &staker, staking_balance.amount, first_stake);
+        let now = env.ledger().timestamp();
+        let prior_lockup_start = env
+            .storage()
+            .persistent()
+            .get::<DataKey, StakingMetrics>(&DataKey::StakingMetrics(staker.clone()))
+            .map(|metrics| metrics.lockup_started_at)
+            .unwrap_or(staking_balance.last_stake_timestamp);
+        let prior_lockup_seconds = now
+            .saturating_sub(prior_lockup_start)
+            .min(MAX_LOCKUP_DURATION_SECONDS);
+        let combined_amount = staking_balance.amount.saturating_add(amount);
+        let weighted_lockup_seconds = if first_stake {
+            0
+        } else {
+            prior_lockup_seconds.saturating_mul(staking_balance.amount) / combined_amount
+        };
+        let mut staking_metrics: StakingMetrics = env
+            .storage()
+            .persistent()
+            .get(&DataKey::StakingMetrics(staker.clone()))
+            .expect("Staking metrics not initialized");
+        staking_metrics.lockup_started_at = now.saturating_sub(weighted_lockup_seconds as u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::StakingMetrics(staker.clone()), &staking_metrics);
         staking_balance.amount += amount;
-        staking_balance.last_stake_timestamp = env.ledger().timestamp();
+        staking_balance.last_stake_timestamp = now;
 
         env.storage()
             .persistent()
@@ -7439,11 +7677,23 @@ impl SoroTaskContract {
         // Update staking pool
         let mut updated_pool = pool.clone();
         updated_pool.total_staked += amount;
-        updated_pool.stakers_count += 1;
+        if first_stake {
+            updated_pool.stakers_count += 1;
+        }
 
         env.storage()
             .instance()
             .set(&DataKey::StakingPool, &updated_pool);
+        let reward_per_token: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StakingRewardPerToken)
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::StakingRewardPerTokenPaid(staker.clone()),
+            &reward_per_token,
+        );
+        Self::distribute_staking_reward_reserve(&env, updated_pool.total_staked);
 
         // Emit Staked event
         env.events().publish(
@@ -7479,6 +7729,12 @@ impl SoroTaskContract {
         if staking_balance.amount < amount {
             panic_with_error!(&env, Error::InsufficientBalance);
         }
+        if amount <= 0 {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        Self::accrue_staking_rewards(&env, &staker, &mut staking_balance);
+        Self::update_staking_metrics(&env, &staker, staking_balance.amount, false);
 
         // Get token address
         let token_address: Address = env
@@ -7521,6 +7777,7 @@ impl SoroTaskContract {
         updated_pool.total_staked -= amount;
         if staking_balance.amount == 0 {
             updated_pool.stakers_count -= 1;
+            Self::update_staking_metrics(&env, &staker, 0, true);
         }
 
         env.storage()
@@ -7558,40 +7815,44 @@ impl SoroTaskContract {
             .get::<DataKey, StakingBalance>(&DataKey::StakingBalance(staker.clone()))
             .expect("No staking balance found");
 
-        // Calculate rewards
+        // Accrue fee revenue and time-based rewards before compounding.
+        Self::accrue_staking_rewards(&env, &staker, &mut staking_balance);
         let now = env.ledger().timestamp();
-        let time_elapsed = now.saturating_sub(pool.last_reward_timestamp);
-        let reward_amount =
-            (staking_balance.amount * pool.reward_rate * (time_elapsed as i128)) / 1_000_000;
+        let reward_amount = staking_balance.accumulated_rewards;
 
         if reward_amount > 0 {
-            // Get token address
-            let token_address: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Token)
-                .expect("Token not initialized");
-
-            // Transfer rewards to staker
-            let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-            token_client.transfer(&env.current_contract_address(), &staker, &reward_amount);
-            assert_balance_invariant(&env);
-
-            // Update staking balance
-            staking_balance.accumulated_rewards += reward_amount;
+            Self::update_staking_metrics(&env, &staker, staking_balance.amount, false);
+            staking_balance.amount = staking_balance.amount.saturating_add(reward_amount);
+            staking_balance.accumulated_rewards = 0;
             staking_balance.last_stake_timestamp = now;
+            add_total_keeper_stakes(&env, reward_amount);
+            assert_balance_invariant(&env);
 
             env.storage()
                 .persistent()
                 .set(&DataKey::StakingBalance(staker.clone()), &staking_balance);
 
-            // Update staking pool last reward timestamp
             let mut updated_pool = pool.clone();
+            updated_pool.total_staked = updated_pool.total_staked.saturating_add(reward_amount);
             updated_pool.last_reward_timestamp = now;
 
             env.storage()
                 .instance()
                 .set(&DataKey::StakingPool, &updated_pool);
+
+            let mut voting_power = env
+                .storage()
+                .persistent()
+                .get::<DataKey, VotingPower>(&DataKey::GovernanceVotingPower(staker.clone()))
+                .unwrap_or(VotingPower {
+                    address: staker.clone(),
+                    voting_power: 0,
+                });
+            voting_power.voting_power = voting_power.voting_power.saturating_add(reward_amount);
+            env.storage().persistent().set(
+                &DataKey::GovernanceVotingPower(staker.clone()),
+                &voting_power,
+            );
 
             // Emit RewardsClaimed event
             env.events().publish(
@@ -7604,6 +7865,21 @@ impl SoroTaskContract {
             );
         }
         exit_security_guard(&env);
+    }
+
+    pub fn get_staker_effective_stake(env: Env, staker: Address) -> i128 {
+        Self::effective_stake(&env, &staker)
+    }
+
+    pub fn get_staking_fee_discount_bps(env: Env, staker: Address) -> u32 {
+        Self::staking_fee_discount_bps(&env, &staker)
+    }
+
+    pub fn get_staking_reward_reserve(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::StakingRewardReserve)
+            .unwrap_or(0)
     }
 
     /// Creates a new governance proposal.
@@ -10844,7 +11120,6 @@ pub(crate) mod tests {
             min_fee: 100,
             max_fee: 10000,
         });
-
         // Configure fee split: 0 bps (no protocol fee), so keeper gets full fee.
         client.set_protocol_fee_bps(&0);
 
@@ -11092,11 +11367,12 @@ pub(crate) mod tests {
             min_fee: 100,
             max_fee: 10000,
         });
+        client.init_staking_pool(&0);
 
-        // Split: protocol_fee_bps=500 => 5% of 100 = 5, keeper gets 95.
+        // Split: protocol_fee_bps=1000 => 10% of 100 = 10 before rebates.
         let fee_recipient = Address::generate(&env);
         client.set_fee_recipient(&fee_recipient);
-        client.set_protocol_fee_bps(&500);
+        client.set_protocol_fee_bps(&1_000);
 
         let target = env.register(MockTarget, ());
         let mut cfg = base_config(&env, target);
@@ -11105,20 +11381,30 @@ pub(crate) mod tests {
         let task_id = client.register(&cfg);
 
         let keeper = Address::generate(&env);
-        token_admin_client.mint(&creator, &5000);
-        token_admin_client.mint(&keeper, &0);
+        token_admin_client.mint(&creator, &2_000);
+        token_admin_client.mint(&keeper, &MIN_KEEPER_STAKE);
         token_admin_client.mint(&fee_recipient, &0);
 
+        client.stake_tokens(&creator, &1_000);
+        client.bond_keeper_stake(&keeper, &MIN_KEEPER_STAKE);
         client.deposit_gas(&task_id, &creator, &1000);
 
         set_timestamp(&env, 3600);
         client.execute(&keeper, &task_id);
 
-        // gas_balance reduced by total fee 100
-        assert_eq!(client.get_task(&task_id).unwrap().gas_balance, 900);
+        // The Bronze rebate reduces the task charge by one token.
+        assert_eq!(client.get_task(&task_id).unwrap().gas_balance, 901);
 
-        assert_eq!(token_client.balance(&fee_recipient), 5);
-        assert_eq!(token_client.balance(&keeper), 95);
+        assert_eq!(token_client.balance(&fee_recipient), 8);
+        assert_eq!(token_client.balance(&keeper), 90);
+        assert_eq!(client.get_staking_reward_reserve(), 0);
+
+        client.claim_rewards(&creator);
+        let staking_balance = client.get_staking_balance(&creator).unwrap();
+        assert_eq!(staking_balance.amount, 1_001);
+        assert_eq!(staking_balance.accumulated_rewards, 0);
+        assert_eq!(client.get_total_keeper_stakes(), 1_501);
+        assert!(client.check_balance_invariant());
     }
 
 
@@ -11634,6 +11920,84 @@ pub(crate) mod tests {
         let pool = client.get_staking_pool();
         assert_eq!(pool.total_staked, 100);
         assert_eq!(pool.stakers_count, 1);
+    }
+
+    #[test]
+    fn test_staking_fee_discount_uses_twas_and_lockup_multiplier() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+        let year = MAX_LOCKUP_DURATION_SECONDS;
+        set_timestamp(&env, year);
+
+        let below_bronze = Address::generate(&env);
+        let bronze = Address::generate(&env);
+        let silver = Address::generate(&env);
+        let gold = Address::generate(&env);
+        let twas_silver = Address::generate(&env);
+        let twas_gold = Address::generate(&env);
+        let current_balances = [
+            (below_bronze.clone(), 999i128),
+            (bronze.clone(), BRONZE_EFFECTIVE_STAKE),
+            (silver.clone(), SILVER_EFFECTIVE_STAKE),
+            (gold.clone(), GOLD_EFFECTIVE_STAKE),
+        ];
+
+        env.as_contract(&id, || {
+            for (address, amount) in current_balances.iter() {
+                let address = (*address).clone();
+                env.storage().persistent().set(
+                    &DataKey::StakingBalance(address.clone()),
+                    &StakingBalance {
+                        address: address.clone(),
+                        amount: *amount,
+                        last_stake_timestamp: year,
+                        accumulated_rewards: 0,
+                    },
+                );
+                env.storage().persistent().set(
+                    &DataKey::StakingMetrics(address.clone()),
+                    &StakingMetrics {
+                        cumulative_stake_seconds: 0,
+                        tracking_started_at: year,
+                        last_updated_at: year,
+                        lockup_started_at: year,
+                    },
+                );
+            }
+
+            for (address, average_stake) in [
+                (twas_silver.clone(), 49_999i128),
+                (twas_gold.clone(), 50_000i128),
+            ] {
+                env.storage().persistent().set(
+                    &DataKey::StakingBalance(address.clone()),
+                    &StakingBalance {
+                        address: address.clone(),
+                        amount: 200_000,
+                        last_stake_timestamp: 0,
+                        accumulated_rewards: 0,
+                    },
+                );
+                env.storage().persistent().set(
+                    &DataKey::StakingMetrics(address),
+                    &StakingMetrics {
+                        cumulative_stake_seconds: average_stake * year as i128,
+                        tracking_started_at: 0,
+                        last_updated_at: year,
+                        lockup_started_at: 0,
+                    },
+                );
+            }
+        });
+
+        assert_eq!(client.get_staking_fee_discount_bps(&below_bronze), 0);
+        assert_eq!(client.get_staking_fee_discount_bps(&bronze), 1_000);
+        assert_eq!(client.get_staking_fee_discount_bps(&silver), 2_500);
+        assert_eq!(client.get_staking_fee_discount_bps(&gold), 5_000);
+        assert_eq!(client.get_staker_effective_stake(&twas_silver), 99_998);
+        assert_eq!(client.get_staking_fee_discount_bps(&twas_silver), 2_500);
+        assert_eq!(client.get_staker_effective_stake(&twas_gold), 100_000);
+        assert_eq!(client.get_staking_fee_discount_bps(&twas_gold), 5_000);
     }
 
     /// Test governance proposal creation and voting.
