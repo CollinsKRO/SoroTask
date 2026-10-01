@@ -1143,6 +1143,8 @@ pub enum DataKey {
     VdfProofs(u64),
     /// Per-block execution counter for rate limiting (Issue #831)
     BlockExecutionCount,
+    /// Fingerprint of the persisted storage schema used by upgrade validation.
+    StorageSchemaHash,
     /// Cumulative user execution count for fee discount tiers (Issue #826)
     UserExecutionCount(Address),
     /// Last ledger sequence number tracked for rate limiting
@@ -5588,42 +5590,13 @@ impl SoroTaskContract {
         new_version: u32,
     ) {
         enter_security_guard(&env);
-
-        let mut config = require_proxy_admin(&env, &admin);
-
-        if config.version != expected_version || new_version <= config.version {
-            panic_with_error!(&env, Error::InvalidUpgradeVersion);
-        }
-
-        let upgrade_id = config.upgrade_count + 1;
-        let record = UpgradeRecord {
-            previous_version: config.version,
+        upgrade::execute_upgrade_with_params(
+            &env,
+            &admin,
+            &new_wasm_hash,
+            expected_version,
             new_version,
-            implementation_hash: new_wasm_hash.clone(),
-            upgraded_by: admin.clone(),
-            upgraded_at: env.ledger().timestamp(),
-        };
-
-        config.version = new_version;
-        config.implementation_hash = Some(new_wasm_hash.clone());
-        config.upgrade_count = upgrade_id;
-
-        env.storage()
-            .instance()
-            .set(&DataKey::UpgradeRecord(upgrade_id), &record);
-        set_proxy_config(&env, &config);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "ContractUpgraded"),
-                Symbol::new(&env, "v1"),
-                upgrade_id,
-            ),
-            record,
         );
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
-
         exit_security_guard(&env);
     }
 
