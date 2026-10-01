@@ -94,6 +94,8 @@ pub enum Error {
     InvalidVdfProof = 58,
     UpgradeNotProposed = 59,
     UpgradeTimelockActive = 60,
+    InsuranceReserveInsufficient = 61,
+    InsuranceClaimNotCertified = 62,
     // Oracle freshness / multi-oracle errors (Issues #1040, #1041)
     OracleStale = 411,
     OracleDeviationExceeded = 412,
@@ -989,6 +991,16 @@ pub struct InsuranceSolvencyReport {
     pub target_reserve: i128,
     pub solvency_ratio_bps: u32,
     pub is_solvent: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InsuranceFaultProof {
+    pub task_id: u64,
+    pub keeper: Address,
+    pub certified_by: Address,
+    pub failure_reason: Bytes,
+    pub certified_at: u64,
 }
 
 /// Supported cross-chain source networks for the CCIP Trigger Gateway.
@@ -2506,6 +2518,18 @@ impl SoroTaskContract {
 
         exit_security_guard(&env);
         counter
+    }
+
+    /// Registers a task and attaches insurance atomically, charging its 1% premium.
+    pub fn register_insured(
+        env: Env,
+        config: TaskConfig,
+        coverage_amount: i128,
+    ) -> u64 {
+        let owner = config.creator.clone();
+        let task_id = Self::register(env.clone(), config);
+        Self::purchase_task_insurance(env, owner, task_id, coverage_amount);
+        task_id
     }
 
     /// Retrieves a task configuration by its ID.
@@ -8905,6 +8929,199 @@ impl SoroTaskContract {
     // Automated Insurance Vault Auto-Refill from Excess Protocol Profits (Issue #891)
     // ============================================================================
 
+    /// Purchases a task insurance policy for a 1% premium on the task's gas budget.
+    /// The premium is transferred into the contract and recorded as funded reserve.
+    pub fn purchase_task_insurance(
+        env: Env,
+        owner: Address,
+        task_id: u64,
+        coverage_amount: i128,
+    ) -> u64 {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        owner.require_auth();
+
+        let task = load_task(&env, task_id).expect("Task not found");
+        if task.creator != owner || coverage_amount <= 0 || coverage_amount > task.gas_balance {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TaskInsurancePolicy(task_id))
+        {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let premium = insurance::premium_for_task_balance(task.gas_balance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+        soroban_sdk::token::Client::new(&env, &token_address).transfer(
+            &owner,
+            &env.current_contract_address(),
+            &premium,
+        );
+        insurance::record_premium(&env, premium);
+
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsurancePolicyCounter)
+            .unwrap_or(0);
+        counter = counter.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsurancePolicyCounter, &counter);
+        let policy = InsurancePolicy {
+            policy_id: counter,
+            owner: owner.clone(),
+            task_id,
+            premium_paid: premium,
+            coverage_amount,
+            status: ClaimStatus::Active,
+            created_at: env.ledger().timestamp(),
+            failure_reason: Bytes::new(&env),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(counter), &policy);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TaskInsurancePolicy(task_id), &counter);
+        assert_balance_invariant(&env);
+        env.events().publish(
+            (
+                Symbol::new(&env, "TaskInsurancePurchased"),
+                Symbol::new(&env, "v1"),
+                task_id,
+            ),
+            (counter, premium, coverage_amount),
+        );
+        exit_security_guard(&env);
+        counter
+    }
+
+    /// Records an admin-certified keeper fault for an insured task.
+    /// Certification requires the keeper's on-chain bond to be slashed.
+    pub fn certify_insurance_failure(
+        env: Env,
+        admin: Address,
+        task_id: u64,
+        keeper: Address,
+        failure_reason: Bytes,
+    ) {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        require_config_admin(&env, &admin);
+        if failure_reason.is_empty()
+            || load_task(&env, task_id).is_none()
+            || !env
+                .storage()
+                .persistent()
+                .has(&DataKey::TaskInsurancePolicy(task_id))
+        {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let bond: KeeperBond = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperBond(keeper.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InsuranceClaimNotCertified));
+        if !bond.is_slashed {
+            panic_with_error!(&env, Error::InsuranceClaimNotCertified);
+        }
+        env.storage().persistent().set(
+            &DataKey::InsuranceFaultProof(task_id),
+            &InsuranceFaultProof {
+                task_id,
+                keeper,
+                certified_by: admin,
+                failure_reason,
+                certified_at: env.ledger().timestamp(),
+            },
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Pays an insured task's certified claim immediately from funded reserves.
+    pub fn claim_task_insurance(env: Env, owner: Address, task_id: u64) -> i128 {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        owner.require_auth();
+
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaskInsurancePolicy(task_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        let mut policy: InsurancePolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        if policy.owner != owner || policy.status != ClaimStatus::Active {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        if load_task(&env, task_id).is_none() {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let fault_proof: InsuranceFaultProof = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFaultProof(task_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InsuranceClaimNotCertified));
+        if fault_proof.task_id != task_id {
+            panic_with_error!(&env, Error::InsuranceClaimNotCertified);
+        }
+        let payout = policy
+            .coverage_amount
+            .min(insurance::claimable_balance(&env));
+        if payout <= 0 {
+            panic_with_error!(&env, Error::InsuranceReserveInsufficient);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+        soroban_sdk::token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &owner,
+            &payout,
+        );
+        insurance::record_claim_payment(&env, payout);
+        policy.status = ClaimStatus::Paid;
+        policy.failure_reason = fault_proof.failure_reason;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+        assert_balance_invariant(&env);
+        env.events().publish(
+            (
+                Symbol::new(&env, "TaskInsuranceClaimPaid"),
+                Symbol::new(&env, "v1"),
+                task_id,
+            ),
+            (policy_id, owner, payout),
+        );
+        exit_security_guard(&env);
+        payout
+    }
+
+    pub fn get_task_insurance_policy(env: Env, task_id: u64) -> Option<InsurancePolicy> {
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaskInsurancePolicy(task_id))?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+    }
+
     /// Diverts 15% protocol fee share to dedicated Insurance Vault storage upon task execution.
     pub fn refill_insurance_from_profit(env: Env, protocol_profit: i128) -> i128 {
         enter_security_guard(&env);
@@ -8943,6 +9160,9 @@ impl SoroTaskContract {
         target_reserve: i128,
     ) -> InsuranceSolvencyReport {
         enter_security_guard(&env);
+        if target_reserve < 0 {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
         env.storage()
             .instance()
             .set(&DataKey::InsuranceTargetReserve, &target_reserve);
@@ -8952,11 +9172,7 @@ impl SoroTaskContract {
 
     /// Generates automated solvency reporting metrics for the insurance vault.
     pub fn get_insurance_vault_solvency(env: Env) -> InsuranceSolvencyReport {
-        let balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::InsuranceVaultBalance)
-            .unwrap_or(0);
+        let balance = insurance::solvency_balance(&env);
 
         let target: i128 = env
             .storage()
