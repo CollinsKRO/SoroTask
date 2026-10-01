@@ -27,6 +27,8 @@ pub struct TaskMeta {
     pub whitelist: Vec<Address>,
     pub yield_strategy: Option<u64>,
     pub permissions: u32,
+    pub max_runs: u64,
+    pub expiration_timestamp: u64,
 }
 
 /// Heavy cross-contract invocation payload — loaded only when dispatching.
@@ -102,6 +104,8 @@ pub fn load_task_meta(env: &Env, task_id: u64) -> Option<TaskMeta> {
         whitelist: c.whitelist,
         yield_strategy: c.yield_strategy,
         permissions: c.permissions,
+        max_runs: c.max_runs,
+        expiration_timestamp: c.expiration_timestamp,
     })
 }
 
@@ -148,6 +152,8 @@ pub fn load_task_config(env: &Env, task_id: u64) -> Option<TaskConfig> {
         blocked_by: meta.blocked_by,
         yield_strategy: meta.yield_strategy,
         permissions: meta.permissions,
+        max_runs: meta.max_runs,
+        expiration_timestamp: meta.expiration_timestamp,
     })
 }
 
@@ -163,6 +169,8 @@ pub fn save_task_split(env: &Env, task_id: u64, config: &TaskConfig) {
         whitelist: config.whitelist.clone(),
         yield_strategy: config.yield_strategy,
         permissions: config.permissions,
+        max_runs: config.max_runs,
+        expiration_timestamp: config.expiration_timestamp,
     };
     let payload = TaskPayload {
         target: config.target.clone(),
@@ -215,6 +223,24 @@ pub fn record_successful_run(env: &Env, task_id: u64, last_run: u64) {
         meta.last_run = last_run;
         save_task_meta(env, task_id, &meta);
     }
+}
+
+/// Checks if task has reached retirement conditions.
+pub fn is_task_retired(env: &Env, task_id: u64) -> bool {
+    if let Some(meta) = load_task_meta(env, task_id) {
+        let stats = load_task_stats(env, task_id);
+        
+        // Check max_runs
+        if meta.max_runs > 0 && stats.run_count >= meta.max_runs {
+            return true;
+        }
+        
+        // Check expiration
+        if meta.expiration_timestamp > 0 && env.ledger().timestamp() >= meta.expiration_timestamp {
+            return true;
+        }
+    }
+    false
 }
 
 /// Records execution trace in temporary storage — automatically expires.

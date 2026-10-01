@@ -114,6 +114,8 @@ pub enum Error {
     InvalidPauseThreshold = 67,
     TaskStillActive = 68,
     AbandonmentPeriodNotElapsed = 69,
+    TaskRetired = 70,
+    TaskExpired = 71,
     // Cross-chain errors
     UnsupportedSourceChain = 700,
     InvalidCrossChainPayload = 701,
@@ -278,6 +280,9 @@ const DEFAULT_VRF_EXPIRATION_SECONDS: u64 = 0;
 /// Minimum stake a keeper must bond to claim restricted tasks (Issue #1043), in token units.
 const MIN_KEEPER_STAKE: i128 = 500;
 
+/// Cleanup bounty percentage (1% of refunded gas balance)
+const CLEANUP_BOUNTY_BPS: u32 = 100;
+
 /// State Archival TTL Extension Thresholds (Issue #1031)
 pub const MIN_THRESHOLD_LEDGERS: u32 = 100_000;
 pub const EXTEND_TO_LEDGERS: u32 = 500_000;
@@ -320,6 +325,10 @@ pub struct TaskConfig {
     pub yield_strategy: Option<u64>,
     /// Gas-optimized bitmask vector for role-based permissions
     pub permissions: u32,
+    /// Maximum number of executions before retirement (0 = unlimited)
+    pub max_runs: u64,
+    /// Timestamp after which task expires (0 = no expiration)
+    pub expiration_timestamp: u64,
 }
 
 /// A single invocation within a [`TaskBundle`]: `target::function(args)`.
@@ -598,6 +607,15 @@ pub struct KeeperReputationHistory {
     pub reason: Bytes,
     /// Previous score before change
     pub previous_score: u64,
+}
+
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum TaskStatus {
+    Active,
+    Paused,
+    Retired,
+    Expired,
 }
 
 #[contracttype]
