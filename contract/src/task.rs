@@ -38,3 +38,13 @@ where
     storage::save_task_meta(env, task_id, &meta);
     Some(meta)
 }
+
+/// Bumps task storage TTL — called by keepers to prevent archival.
+pub fn bump_ttl(env: &Env, task_id: u64) {
+    storage::bump_task_ttl(env, task_id);
+}
+
+/// Logs execution trace to temporary storage with auto-expiry.
+pub fn log_execution(env: &Env, task_id: u64, keeper: &soroban_sdk::Address, success: bool, gas_used: i128) {
+    storage::log_execution_trace(env, task_id, keeper, success, gas_used);
+}

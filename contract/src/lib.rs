@@ -21,7 +21,7 @@ pub mod task;
 pub mod admin;
 pub mod upgrade;
 
-pub use storage::{TaskMeta, TaskPayload, TaskStats};
+pub use storage::{ExecutionLog, TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
 
 use soroban_sdk::{
@@ -1030,6 +1030,8 @@ pub enum DataKey {
     /// Leaky bucket keyed by target contract address (Issue #1192).
     TargetInvocationBucket(Address),
     TaskStats(u64),
+    /// Execution logs stored in temporary storage (auto-expiring traces)
+    ExecutionLog(u64, u64),
     StorageSchemaVersion,
     UpgradeProposal,
     /// Per-task delegated permission bitmask for a non-creator address
