@@ -20,9 +20,11 @@ pub mod storage;
 pub mod task;
 pub mod admin;
 pub mod upgrade;
+pub mod optimistic;
 
 pub use storage::{ExecutionLog, TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
+pub use optimistic::{OptimisticClaim, FraudProof, CHALLENGE_WINDOW_LEDGERS, MIN_OPTIMISTIC_BOND};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, xdr::ToXdr, Address,
@@ -1188,6 +1190,12 @@ pub enum DataKey {
     CrossChainTaskCounter,
     /// Cross-chain gateway: per-chain enabled flag
     CrossChainSourceEnabled(u32),
+    /// Optimistic execution claims
+    OptimisticClaim(u64),
+    /// Optimistic claim counter
+    OptimisticClaimCounter,
+    /// Fraud proofs for challenged claims
+    FraudProof(u64),
 }
 
 /// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
