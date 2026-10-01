@@ -257,9 +257,10 @@ const CROSS_CHAIN_MAX_MESSAGE_AGE: u64 = 3_600;
 const CROSS_CHAIN_MIN_CONFIRMATIONS: u64 = 1;
 /// Ledgers a submitted optimistic resolver-condition claim stays open to
 /// challenge before it can be finalized.
-const OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS: u32 = 100;
+const OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS: u32 = 10;
 /// Minimum bond a keeper must post to submit an optimistic claim.
 const MIN_OPTIMISTIC_BOND: i128 = 100;
+const MIN_CHALLENGER_BOND: i128 = 100;
 
 /// Maximum age in seconds for oracle price feed data before it is considered stale (Issue #1040).
 const MAX_ORACLE_DELAY_SECONDS: u64 = 300;
@@ -1145,6 +1146,8 @@ pub enum DataKey {
     VrfCommit(u64),
     /// Keeper economic bond storage (Issue #1043)
     KeeperBond(Address),
+    KeeperSlashCount(Address),
+    PendingOptimisticClaims(Address),
     /// Whitelist of keepers allowed to claim restricted tasks
     RestrictedTaskKeepers,
     /// Whether a task requires bonded keepers (Issue #1043)
@@ -4107,14 +4110,8 @@ impl SoroTaskContract {
 
         Self::require_vrf_keeper_winner(env, task_id, keeper);
 
-        // ── 4b. Keeper economic bonding check (Issue #1043) ───────────────
-        // Only enforce bonding for tasks explicitly marked as restricted.
-        let task_requires_bond: bool = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TaskRequiresBond(task_id))
-            .unwrap_or(false);
-        if task_requires_bond && !Self::is_keeper_bonded(env.clone(), keeper.clone()) {
+        // ── 4b. Mandatory keeper economic bond check (Issue #1174) ────────
+        if !Self::is_keeper_bonded(env.clone(), keeper.clone()) {
             Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
             panic_with_error!(env, Error::KeeperNotBonded);
         }
@@ -5147,7 +5144,19 @@ impl SoroTaskContract {
         enter_security_guard(&env);
         keeper.require_auth();
 
-        if amount < MIN_KEEPER_STAKE {
+        if amount <= 0 {
+            panic_with_error!(&env, Error::KeeperBondInsufficient);
+        }
+        let existing = env
+            .storage()
+            .persistent()
+            .get::<DataKey, KeeperBond>(&DataKey::KeeperBond(keeper.clone()));
+        let bonded_amount = existing
+            .as_ref()
+            .map(|bond| bond.bonded_amount)
+            .unwrap_or(0)
+            .saturating_add(amount);
+        if bonded_amount < MIN_KEEPER_STAKE {
             panic_with_error!(&env, Error::KeeperBondInsufficient);
         }
 
@@ -5158,11 +5167,14 @@ impl SoroTaskContract {
             .expect("Token not initialized");
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
         token_client.transfer(&keeper, &env.current_contract_address(), &amount);
+        add_total_keeper_stakes(&env, amount);
 
         let bond = KeeperBond {
             keeper: keeper.clone(),
-            bonded_amount: amount,
-            bonded_at: env.ledger().timestamp(),
+            bonded_amount,
+            bonded_at: existing
+                .map(|previous| previous.bonded_at)
+                .unwrap_or_else(|| env.ledger().timestamp()),
             is_slashed: false,
         };
 
@@ -5193,6 +5205,15 @@ impl SoroTaskContract {
             .get(&DataKey::KeeperBond(keeper.clone()))
             .expect("No keeper bond found");
 
+        let pending_claims: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingOptimisticClaims(keeper.clone()))
+            .unwrap_or(0);
+        if pending_claims > 0 {
+            panic_with_error!(&env, Error::OptimisticClaimPending);
+        }
+
         if bond.is_slashed {
             panic_with_error!(&env, Error::KeeperSlashed);
         }
@@ -5203,6 +5224,7 @@ impl SoroTaskContract {
             .get(&DataKey::Token)
             .expect("Token not initialized");
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        sub_total_keeper_stakes(&env, bond.bonded_amount);
         token_client.transfer(&env.current_contract_address(), &keeper, &bond.bonded_amount);
 
         env.storage()
@@ -5294,6 +5316,7 @@ impl SoroTaskContract {
         }
 
         update_keeper_total_delegated(&env, &keeper, -total_slashed);
+        sub_total_keeper_stakes(&env, total_slashed);
 
         // Mark keeper as slashed
         if let Some(mut bond) = env
@@ -6069,8 +6092,43 @@ impl SoroTaskContract {
         claimed_condition_result: bool,
         bond: i128,
     ) {
+        Self::submit_optimistic_execution_internal(
+            env,
+            keeper,
+            task_id,
+            claimed_condition_result,
+            bond,
+        );
+    }
+
+    pub fn submit_optimistic_execution(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        claimed_condition_result: bool,
+        bond: i128,
+    ) {
+        Self::submit_optimistic_execution_internal(
+            env,
+            keeper,
+            task_id,
+            claimed_condition_result,
+            bond,
+        );
+    }
+
+    fn submit_optimistic_execution_internal(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        claimed_condition_result: bool,
+        bond: i128,
+    ) {
         enter_security_guard(&env);
         keeper.require_auth();
+        if !Self::is_keeper_bonded(env.clone(), keeper.clone()) {
+            panic_with_error!(&env, Error::KeeperNotBonded);
+        }
 
         if bond < MIN_OPTIMISTIC_BOND {
             panic_with_error!(&env, Error::KeeperStakeTooLow);
@@ -6112,6 +6170,15 @@ impl SoroTaskContract {
         };
         env.storage().persistent().set(&claim_key, &claim);
         env.storage().persistent().extend_ttl(&claim_key, 100_000, 100_000);
+        let pending: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingOptimisticClaims(keeper.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PendingOptimisticClaims(keeper.clone()),
+            &pending.saturating_add(1),
+        );
 
         env.events().publish(
             (
@@ -6144,6 +6211,23 @@ impl SoroTaskContract {
         if env.ledger().sequence() >= claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS {
             panic_with_error!(&env, Error::ChallengeWindowClosed);
         }
+        if challenger == claim.keeper {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_client.transfer(
+            &challenger,
+            &env.current_contract_address(),
+            &MIN_CHALLENGER_BOND,
+        );
+        add_total_keeper_stakes(&env, MIN_CHALLENGER_BOND);
+        assert_balance_invariant(&env);
 
         let task_key = DataKey::Task(task_id);
         let config: TaskConfig = env
@@ -6169,20 +6253,81 @@ impl SoroTaskContract {
         };
 
         if actual_result == claim.claimed_condition_result {
-            panic_with_error!(&env, Error::FraudProofInvalid);
+            sub_total_keeper_stakes(&env, MIN_CHALLENGER_BOND);
+            token_client.burn(&env.current_contract_address(), &MIN_CHALLENGER_BOND);
+            assert_balance_invariant(&env);
+            env.events().publish(
+                (
+                    Symbol::new(&env, "OptimisticChallengeRejected"),
+                    Symbol::new(&env, "v1"),
+                    task_id,
+                ),
+                (challenger, MIN_CHALLENGER_BOND),
+            );
+            exit_security_guard(&env);
+            return;
+        }
+
+        let mut keeper_bond: KeeperBond = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperBond(claim.keeper.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::KeeperNotBonded));
+        let slash_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperSlashCount(claim.keeper.clone()))
+            .unwrap_or(0);
+        let slash_bps = match slash_count {
+            0 => 2_500i128,
+            1 => 5_000i128,
+            _ => 10_000i128,
+        };
+        let slash_amount = keeper_bond.bonded_amount.saturating_mul(slash_bps) / 10_000;
+        if slash_amount <= 0 {
+            panic_with_error!(&env, Error::KeeperBondInsufficient);
         }
 
         claim.resolved = true;
         env.storage().persistent().set(&claim_key, &claim);
-
-        sub_total_keeper_stakes(&env, claim.bond);
-        let token_address: Address = env
+        let pending: u32 = env
             .storage()
-            .instance()
-            .get(&DataKey::Token)
-            .expect("Not initialized");
-        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        token_client.transfer(&env.current_contract_address(), &challenger, &claim.bond);
+            .persistent()
+            .get(&DataKey::PendingOptimisticClaims(claim.keeper.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PendingOptimisticClaims(claim.keeper.clone()),
+            &pending.saturating_sub(1),
+        );
+
+        keeper_bond.bonded_amount -= slash_amount;
+        keeper_bond.is_slashed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::KeeperBond(claim.keeper.clone()), &keeper_bond);
+        let next_slash_count = slash_count.saturating_add(1);
+        env.storage().persistent().set(
+            &DataKey::KeeperSlashCount(claim.keeper.clone()),
+            &next_slash_count,
+        );
+
+        let burn_share = slash_amount / 2;
+        let challenger_share = slash_amount - burn_share;
+        sub_total_keeper_stakes(&env, claim.bond.saturating_add(MIN_CHALLENGER_BOND));
+        sub_total_keeper_stakes(&env, slash_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &claim.keeper,
+            &claim.bond,
+        );
+        if burn_share > 0 {
+            token_client.burn(&env.current_contract_address(), &burn_share);
+        }
+        token_client.transfer(
+            &env.current_contract_address(),
+            &challenger,
+            &MIN_CHALLENGER_BOND.saturating_add(challenger_share),
+        );
         assert_balance_invariant(&env);
 
         Self::set_task_status(&env, task_id, ExecutionOutcome::Failed);
@@ -6224,6 +6369,15 @@ impl SoroTaskContract {
 
         claim.resolved = true;
         env.storage().persistent().set(&claim_key, &claim);
+        let pending: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingOptimisticClaims(claim.keeper.clone()))
+            .unwrap_or(0);
+        env.storage().persistent().set(
+            &DataKey::PendingOptimisticClaims(claim.keeper.clone()),
+            &pending.saturating_sub(1),
+        );
 
         sub_total_keeper_stakes(&env, claim.bond);
         let token_address: Address = env
@@ -12516,8 +12670,7 @@ pub(crate) mod tests {
     }
 
     /// Sets up a contract + gas token + a registered task (optionally with a
-    /// resolver), returning `(env, client, task_id, keeper)` with the keeper
-    /// pre-funded with 1,000 gas tokens.
+    /// resolver), returning `(env, client, task_id, keeper)`.
     fn setup_optimistic_task(
         resolver: OptimisticResolver,
     ) -> (Env, SoroTaskContractClient<'static>, u64, Address) {
@@ -12547,6 +12700,7 @@ pub(crate) mod tests {
 
         let keeper = Address::generate(&env);
         token_admin_client.mint(&keeper, &1_000);
+        client.bond_keeper_stake(&keeper, &MIN_KEEPER_STAKE);
 
         (env, client, task_id, keeper)
     }
@@ -12559,19 +12713,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_unbonded_keeper_cannot_execute() {
+        let (env, client, task_id, _) = setup_optimistic_task(OptimisticResolver::None);
+        let unbonded_keeper = Address::generate(&env);
+        set_timestamp(&env, 3_600);
+
+        let result = client.try_execute(&unbonded_keeper, &task_id);
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::KeeperNotBonded as u32
+            )))
+        );
+    }
+
+    #[test]
     fn test_finalize_optimistic_result_returns_bond_after_window() {
         let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::None);
         let token_address = client.get_token();
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
 
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
-        assert_eq!(token_client.balance(&keeper), 900);
+        assert!(client.try_unbond_keeper_stake(&keeper).is_err());
+        assert_eq!(token_client.balance(&keeper), 400);
 
         env.ledger()
             .with_mut(|l| l.sequence_number += OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS);
         client.finalize_optimistic_result(&task_id);
 
-        assert_eq!(token_client.balance(&keeper), 1_000);
+        assert_eq!(token_client.balance(&keeper), 500);
         assert!(client.get_optimistic_result(&task_id).unwrap().resolved);
     }
 
@@ -12585,8 +12755,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_challenge_optimistic_result_slashes_dishonest_keeper() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         let token_address = client.get_token();
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
 
@@ -12594,10 +12763,25 @@ pub(crate) mod tests {
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
 
         let challenger = Address::generate(&env);
+        let token_address = client.get_token();
+        let token_admin_client =
+            soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        token_admin_client.mint(&challenger, &MIN_CHALLENGER_BOND);
+        let supply_before = token_client.total_supply();
         client.challenge_optimistic_result(&challenger, &task_id);
 
-        assert_eq!(token_client.balance(&challenger), 100);
-        assert_eq!(token_client.balance(&keeper), 900);
+        assert_eq!(
+            token_client.balance(&challenger),
+            100 + MIN_KEEPER_STAKE / 4 - (MIN_KEEPER_STAKE / 4) / 2
+        );
+        assert_eq!(
+            supply_before - token_client.total_supply(),
+            (MIN_KEEPER_STAKE / 4) / 2
+        );
+        assert_eq!(token_client.balance(&keeper), 500);
+        let bond = client.get_keeper_bond(&keeper).unwrap();
+        assert_eq!(bond.bonded_amount, MIN_KEEPER_STAKE - MIN_KEEPER_STAKE / 4);
+        assert!(bond.is_slashed);
         assert!(client.get_optimistic_result(&task_id).unwrap().resolved);
         assert_eq!(
             client.get_task_status(&task_id).outcome,
@@ -12606,20 +12790,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #50)")]
-    fn test_challenge_optimistic_result_reverts_when_claim_is_honest() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysTrue);
+    fn test_challenge_optimistic_result_forfeits_bad_challenge_bond() {
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysTrue);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         let challenger = Address::generate(&env);
+        let token_address = client.get_token();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        token_admin_client.mint(&challenger, &MIN_CHALLENGER_BOND);
         client.challenge_optimistic_result(&challenger, &task_id);
+        assert_eq!(token_client.balance(&challenger), 0);
+        assert!(!client.get_optimistic_result(&task_id).unwrap().resolved);
+        assert!(client.try_unbond_keeper_stake(&keeper).is_err());
     }
 
     #[test]
     #[should_panic(expected = "Error(Contract, #48)")]
     fn test_challenge_optimistic_result_after_window_reverts() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         env.ledger()
             .with_mut(|l| l.sequence_number += OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS);
