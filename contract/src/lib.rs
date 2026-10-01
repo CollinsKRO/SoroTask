@@ -26,7 +26,11 @@ pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Val, Vec,
+    Bytes, BytesN, Env, IntoVal, Symbol, TryIntoVal, Val, Vec,
+};
+use vrf_rfc9381::{
+    ec::edwards25519::{tai::EdVrfEdwards25519TaiPublicKey, EdVrfProof},
+    Proof as VrfProof, Verifier as VrfVerifier,
 };
 
 #[contracterror]
@@ -1080,11 +1084,13 @@ pub enum DataKey {
     FeeRecipient,
     ProtocolFeeBps,
     VrfOracleAddress,
+    VrfOraclePublicKey,
 
     VrfRequestCounter,
     VrfRequests(u64),
     VrfResponses(u64),
     VrfKeeperAssignment(u64),
+    VrfKeeperAssignmentExclusiveUntil(u64),
     OracleConfig(OracleProvider),
     OracleRequestCounter,
     OracleRequests(u64),
@@ -2762,6 +2768,9 @@ impl SoroTaskContract {
         }
         for i in 0..keepers.len() {
             let left = keepers.get(i).unwrap();
+            if !Self::is_keeper_bonded(env.clone(), left.clone()) {
+                panic_with_error!(&env, Error::KeeperNotBonded);
+            }
             let mut j = i + 1;
             while j < keepers.len() {
                 if left == keepers.get(j).unwrap() {
@@ -2794,6 +2803,19 @@ impl SoroTaskContract {
                     panic_with_error!(&env, Error::Unauthorized);
                 }
             }
+        }
+
+        if env.ledger().timestamp()
+            < config.last_run.saturating_add(config.interval as u64)
+        {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::VrfKeeperAssignment(task_id))
+        {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
         }
 
         let mut request_counter: u64 = env
@@ -3310,6 +3332,25 @@ impl SoroTaskContract {
             .persistent()
             .set(&DataKey::VrfRequests(request_id), &vrf_request);
 
+        if let Some(assignment) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, VrfKeeperAssignment>(
+                &DataKey::VrfKeeperAssignment(vrf_request.task_id),
+            )
+        {
+            if assignment.request_id == request_id {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::VrfKeeperAssignment(vrf_request.task_id));
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::VrfKeeperAssignmentExclusiveUntil(
+                        vrf_request.task_id,
+                    ));
+            }
+        }
+
         env.events().publish(
             (
                 Symbol::new(&env, "VrfRequestCancelled"),
@@ -3376,17 +3417,22 @@ impl SoroTaskContract {
             }
         }
 
-        // Validate random number
-        if random_number < 0 {
-            panic_with_error!(&env, Error::VrfRequestFailed);
-        }
-
-        // Validate proof
-        if proof.len() == 0 {
-            panic_with_error!(&env, Error::VrfRequestFailed);
-        }
-        if proof.len() > 1024 {
-            panic_with_error!(&env, Error::VrfRequestFailed);
+        let oracle_public_key: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VrfOraclePublicKey)
+            .ok_or(Error::VrfOracleNotSet)
+            .expect("VRF oracle public key not set");
+        let verifier = EdVrfEdwards25519TaiPublicKey::from_slice(&oracle_public_key.to_array())
+            .unwrap_or_else(|_| panic_with_error!(&env, Error::InvalidVrfRequest));
+        let alpha = Self::vrf_signature_payload(&env, request_id, vrf_request.task_id);
+        let decoded_proof = EdVrfProof::decode_pi(&proof.to_alloc_vec())
+            .unwrap_or_else(|_| panic_with_error!(&env, Error::InvalidVrfRequest));
+        let output = verifier
+            .verify(&alpha.to_alloc_vec(), decoded_proof)
+            .unwrap_or_else(|_| panic_with_error!(&env, Error::InvalidVrfRequest));
+        if Self::vrf_random_number(output.as_slice()) != random_number {
+            panic_with_error!(&env, Error::InvalidVrfRequest);
         }
 
         // Create VRF response
@@ -4544,6 +4590,9 @@ impl SoroTaskContract {
             env.storage()
                 .persistent()
                 .remove(&DataKey::VrfKeeperAssignment(task_id));
+            env.storage()
+                .persistent()
+                .remove(&DataKey::VrfKeeperAssignmentExclusiveUntil(task_id));
             Self::set_task_status(env, task_id, ExecutionOutcome::Success);
             final_outcome = ExecutionOutcome::Success;
 
@@ -6908,6 +6957,29 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Sets the RFC 9381 Edwards25519 TAI public key used to verify VRF proofs.
+    pub fn set_vrf_oracle_public_key(env: Env, public_key: BytesN<32>) {
+        enter_security_guard(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::AdminAddress)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .set(&DataKey::VrfOraclePublicKey, &public_key);
+        env.events().publish(
+            (
+                Symbol::new(&env, "VrfOraclePublicKeySet"),
+                Symbol::new(&env, "v1"),
+            ),
+            public_key,
+        );
+        exit_security_guard(&env);
+    }
+
     /// Configures the VRF commit-reveal delay and expiration windows (Issue #1042).
     /// Only callable by admin.
     pub fn set_vrf_timing_config(env: Env, delay_seconds: u64, expiration_seconds: u64) {
@@ -8821,7 +8893,6 @@ impl SoroTaskContract {
         buf.append(&random_number.to_xdr(env));
         buf.append(&task_id.to_xdr(env));
         buf.append(&request_id.to_xdr(env));
-        buf.append(&env.ledger().sequence().to_xdr(env));
 
         let hash: BytesN<32> = env.crypto().sha256(&buf).into();
         let hash_arr = hash.to_array();
@@ -8830,6 +8901,21 @@ impl SoroTaskContract {
             | ((hash_arr[2] as u32) << 8)
             | hash_arr[3] as u32;
         keepers.get(index_seed % keepers.len()).unwrap()
+    }
+
+    fn vrf_signature_payload(env: &Env, request_id: u64, task_id: u64) -> Bytes {
+        let mut payload = Bytes::from_slice(env, b"SoroTaskECVRFv1");
+        payload.append(&request_id.to_xdr(env));
+        payload.append(&task_id.to_xdr(env));
+        payload
+    }
+
+    fn vrf_random_number(output: &[u8]) -> i128 {
+        let mut random_number = 0i128;
+        for byte in output.iter().take(15) {
+            random_number = (random_number << 8) | *byte as i128;
+        }
+        random_number
     }
 
     fn fulfill_vrf_keeper_assignment_internal(
@@ -8857,6 +8943,14 @@ impl SoroTaskContract {
             assignment.winner = Some(winner.clone());
             assignment.random_number = Some(random_number);
             assignment.fulfilled_at = env.ledger().timestamp();
+            let exclusive_until = env
+                .ledger()
+                .sequence()
+                .saturating_add(VRF_EXCLUSIVE_WINDOW_LEDGERS);
+            env.storage().persistent().set(
+                &DataKey::VrfKeeperAssignmentExclusiveUntil(task_id),
+                &exclusive_until,
+            );
 
             env.storage()
                 .persistent()
@@ -8881,7 +8975,14 @@ impl SoroTaskContract {
         {
             match assignment.winner {
                 Some(winner) => {
-                    if winner != keeper.clone() {
+                    let exclusive_until: u32 = env
+                        .storage()
+                        .persistent()
+                        .get(&DataKey::VrfKeeperAssignmentExclusiveUntil(task_id))
+                        .unwrap_or(0);
+                    if winner != keeper.clone()
+                        && env.ledger().sequence() < exclusive_until
+                    {
                         panic_with_error!(env, Error::Unauthorized);
                     }
                 }
@@ -9374,6 +9475,10 @@ pub(crate) mod tests {
         contract, contractimpl,
         testutils::{Address as _, Events, Ledger as _},
         vec, BytesN, Env, IntoVal,
+    };
+    use vrf_rfc9381::{
+        ec::edwards25519::tai::EdVrfEdwards25519TaiSecretKey,
+        Ciphersuite, Proof as VrfProof, Prover as VrfProver,
     };
 
     // ── Mock Contracts ───────────────────────────────────────────────────────
@@ -12964,6 +13069,15 @@ pub(crate) mod tests {
         let oracle = Address::generate(&env);
         client.set_admin_address(&admin);
         client.set_vrf_oracle_address(&oracle);
+        let public_key = BytesN::from_array(
+            &env,
+            &[
+                0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9,
+                0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02,
+                0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
+            ],
+        );
+        client.set_vrf_oracle_public_key(&public_key);
 
         let target = env.register(MockTarget, ());
         let config = base_config(&env, target);
@@ -12971,15 +13085,46 @@ pub(crate) mod tests {
 
         let keeper_a = Address::generate(&env);
         let keeper_b = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            for keeper in [keeper_a.clone(), keeper_b.clone()] {
+                env.storage().persistent().set(
+                    &DataKey::KeeperBond(keeper.clone()),
+                    &KeeperBond {
+                        keeper,
+                        bonded_amount: MIN_KEEPER_STAKE,
+                        bonded_at: 0,
+                        is_slashed: false,
+                    },
+                );
+            }
+        });
         let keepers = vec![&env, keeper_a.clone(), keeper_b.clone()];
 
+        set_timestamp(&env, 3_600);
         let request_id = client.request_vrf_keeper_assignment(&task_id, &keepers);
         let pending = client.get_vrf_keeper_assignment(&task_id).unwrap();
         assert_eq!(pending.request_id, request_id);
         assert!(pending.winner.is_none());
 
-        let proof = Bytes::from_slice(&env, &[1, 2, 3, 4]);
-        client.fulfill_vrf_request(&request_id, &987_654_321i128, &proof);
+        let secret_key = EdVrfEdwards25519TaiSecretKey::from_slice(&[
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92,
+            0xec, 0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b,
+            0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60,
+        ])
+        .unwrap();
+        let alpha = SoroTaskContract::vrf_signature_payload(&env, request_id, task_id);
+        let vrf_proof = secret_key.prove(&alpha.to_alloc_vec()).unwrap();
+        let output = vrf_proof
+            .proof_to_hash(Ciphersuite::ECVRF_EDWARDS25519_SHA512_TAI)
+            .unwrap();
+        let random_number = SoroTaskContract::vrf_random_number(output.as_slice());
+        let proof = Bytes::from_slice(&env, &vrf_proof.encode_to_pi());
+
+        let forged_proof = Bytes::from_slice(&env, &[1; 80]);
+        assert!(client
+            .try_fulfill_vrf_request(&request_id, &random_number, &forged_proof)
+            .is_err());
+        client.fulfill_vrf_request(&request_id, &random_number, &proof);
 
         let winner = client.get_vrf_keeper_winner(&task_id).unwrap();
         assert!(winner == keeper_a || winner == keeper_b);
@@ -12990,11 +13135,13 @@ pub(crate) mod tests {
             keeper_a.clone()
         };
 
-        set_timestamp(&env, 3_600);
         let loser_result = client.try_execute(&loser, &task_id);
         assert!(loser_result.is_err());
 
-        client.execute(&winner, &task_id);
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number += VRF_EXCLUSIVE_WINDOW_LEDGERS;
+        });
+        client.execute(&loser, &task_id);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 3_600);
         assert!(client.get_vrf_keeper_assignment(&task_id).is_none());
     }
