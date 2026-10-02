@@ -3,6 +3,7 @@
 pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
+pub mod batch;
 pub mod insurance;
 pub mod events;
 pub use events::*;
@@ -1478,7 +1479,7 @@ fn add_total_task_escrows(env: &Env, amount: i128) {
     }
 }
 
-fn sub_total_task_escrows(env: &Env, amount: i128) {
+pub(crate) fn sub_total_task_escrows(env: &Env, amount: i128) {
     if amount > 0 {
         let current = get_total_task_escrows(env);
         set_total_task_escrows(env, current.saturating_sub(amount));
@@ -1664,7 +1665,7 @@ fn set_total_unclaimed_fees(env: &Env, amount: i128) {
         .set(&DataKey::TotalUnclaimedFees, &amount);
 }
 
-fn assert_balance_invariant(env: &Env) {
+pub(crate) fn assert_balance_invariant(env: &Env) {
     if let Some(token_address) = env
         .storage()
         .instance()
@@ -1691,6 +1692,11 @@ fn assert_balance_invariant(env: &Env) {
         );
     }
 }
+            total_unclaimed_fees,
+            insurance_reserve
+        );
+    }
+}
 
 fn read_proxy_config(env: &Env) -> Option<ProxyConfig> {
     admin::read_proxy_config(env)
@@ -1704,11 +1710,11 @@ fn require_proxy_admin(env: &Env, admin: &Address) -> ProxyConfig {
     admin::require_proxy_admin(env, admin)
 }
 
-fn load_task(env: &Env, task_id: u64) -> Option<TaskConfig> {
+pub(crate) fn load_task(env: &Env, task_id: u64) -> Option<TaskConfig> {
     storage::load_task_config(env, task_id)
 }
 
-fn save_task(env: &Env, task_id: u64, config: &TaskConfig) {
+pub(crate) fn save_task(env: &Env, task_id: u64, config: &TaskConfig) {
     storage::save_task_split(env, task_id, config);
 }
 
@@ -3963,9 +3969,11 @@ impl SoroTaskContract {
     /// Executes multiple tasks in a single transaction for gas optimization.
     /// Allows keepers to execute a batch of tasks efficiently.
     ///
-    /// # Safety & Atomicity
-    /// Soroban transactions are fully atomic. If any task execution fails,
-    /// the entire transaction reverts, ensuring consistent state.
+    /// # Partial-failure isolation (#1179)
+    /// Each task is attempted through a fallible path. Target-contract reverts
+    /// are captured via `try_invoke_contract` and recorded in the returned
+    /// [`BatchExecutionSummary`] instead of reverting sibling tasks. Keeper
+    /// fees are settled only for successful executions.
     ///
     /// # Parameters
     /// - `env`: The Soroban environment
@@ -3974,43 +3982,216 @@ impl SoroTaskContract {
     ///
     /// # Errors
     /// - `Error::Unauthorized`: If the keeper is not authorized for any task
-    /// - `Error::TaskNotFound`: If any task ID does not exist
-    /// - `Error::DependencyBlocked`: If any task is blocked by dependencies
-    /// - `Error::InsufficientBalance`: If any task has insufficient gas balance
     /// - `Error::InvalidInterval`: If batch size exceeds MAX_BATCH_SIZE or is empty
-    pub fn batch_execute(env: Env, keeper: Address, task_ids: Vec<u64>) {
+    pub fn batch_execute(env: Env, keeper: Address, task_ids: Vec<u64>) -> batch::BatchExecutionSummary {
         enter_security_guard(&env);
         keeper.require_auth();
 
-        // Validate that we have some tasks to execute
         if task_ids.is_empty() {
             panic_with_error!(&env, Error::InvalidInterval);
         }
 
-        // Validate batch size limit
         if task_ids.len() > MAX_BATCH_SIZE as u32 {
             panic_with_error!(&env, Error::InvalidInterval);
         }
 
-        // Process each task in the batch
+        let mut outcomes: Vec<batch::BatchTaskOutcome> = Vec::new(&env);
+        let mut succeeded: u32 = 0;
+        let mut failed: u32 = 0;
+
         for i in 0..task_ids.len() {
             let task_id = task_ids.get(i).unwrap();
-
-            // Use the existing execute logic for each task
-            // This ensures consistency with single-task execution
-            Self::execute_internal(&env, &keeper, task_id, true);
+            match Self::try_execute_isolated(&env, &keeper, task_id) {
+                Ok(()) => {
+                    succeeded += 1;
+                    outcomes.push_back(batch::BatchTaskOutcome {
+                        task_id,
+                        succeeded: true,
+                        error_code: 0,
+                    });
+                    batch::publish_batch_task_event(&env, &keeper, task_id, true, 0);
+                }
+                Err(code) => {
+                    failed += 1;
+                    outcomes.push_back(batch::BatchTaskOutcome {
+                        task_id,
+                        succeeded: false,
+                        error_code: code,
+                    });
+                    batch::publish_batch_task_event(&env, &keeper, task_id, false, code);
+                }
+            }
         }
 
-        // Emit BatchExecutionCompleted event
+        let summary = batch::BatchExecutionSummary {
+            total: task_ids.len() as u32,
+            succeeded,
+            failed,
+            outcomes,
+        };
+        batch::publish_batch_summary_event(&env, &keeper, &summary);
+
         env.events().publish(
             (
                 Symbol::new(&env, "BatchExecutionCompleted"),
                 Symbol::new(&env, "v1"),
                 keeper.clone(),
             ),
-            (task_ids.len(), task_ids),
+            (summary.total, summary.succeeded, summary.failed),
         );
         exit_security_guard(&env);
+        summary
+    }
+
+    /// Fallible single-task execution used by [`Self::batch_execute`].
+    ///
+    /// Returns `Ok(())` after the target call succeeds and keeper fees are
+    /// settled, or `Err(error_code)` on any recoverable failure. Never panics
+    /// for per-task outcomes so siblings can continue.
+    fn try_execute_isolated(env: &Env, keeper: &Address, task_id: u64) -> Result<(), u32> {
+        use events::{ExecutionStep, StepResult};
+
+        let mut config: TaskConfig = match batch::load_task_or_error(env, task_id) {
+            Ok(cfg) => cfg,
+            Err(err) => return Err(err as u32),
+        };
+
+        if Self::is_protocol_paused(env.clone()) {
+            return Err(Error::TaskPaused as u32);
+        }
+        if !config.is_active {
+            return Err(Error::TaskPaused as u32);
+        }
+
+        // Interval gate — last_run is a ledger timestamp (u64).
+        let now = env.ledger().timestamp();
+        if config.last_run > 0 && now.saturating_sub(config.last_run) < config.interval as u64 {
+            return Err(Error::InvalidInterval as u32);
+        }
+
+        // Whitelist: empty means open; otherwise keeper must be listed.
+        if !config.whitelist.is_empty() && !config.whitelist.contains(keeper) {
+            return Err(Error::Unauthorized as u32);
+        }
+
+        // Dependency gate
+        for i in 0..config.blocked_by.len() {
+            let dep_id = config.blocked_by.get(i).unwrap();
+            if let Some(dep) = load_task(env, dep_id) {
+                if dep.is_active {
+                    return Err(Error::DependencyBlocked as u32);
+                }
+            }
+        }
+
+        // Fee + balance
+        let fee: i128 = Self::calculate_execution_fee(env, &config);
+        if config.gas_balance < fee {
+            return Err(Error::InsufficientBalance as u32);
+        }
+
+        events::EventLogger::log_execution_step(
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CalculateFee,
+            StepResult::Passed,
+            fee as u32,
+        );
+
+        // Target call — isolated via try_invoke_contract so a revert does not
+        // abort sibling tasks (#1179).
+        let invoke_result =
+            batch::try_invoke_target(env, &config.target, &config.function, config.args.clone());
+        if let Err(code) = invoke_result {
+            events::EventLogger::log_execution_step(
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CallTarget,
+                StepResult::Failed,
+                code,
+            );
+            return Err(code);
+        }
+
+        events::EventLogger::log_execution_step(
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CallTarget,
+            StepResult::Passed,
+            0,
+        );
+
+        // Settle fees only for successful executions.
+        let protocol_fee_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let (protocol_fee, keeper_fee) =
+            math::split_execution_fee(fee, protocol_fee_bps).unwrap_or((0, fee));
+
+        config.gas_balance -= fee;
+        sub_total_task_escrows(env, fee);
+
+        if env.storage().instance().has(&DataKey::Token) {
+            let token_address: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::Token)
+                .expect("Not initialized");
+            let token_client = soroban_sdk::token::Client::new(env, &token_address);
+
+            if protocol_fee > 0 {
+                let fee_recipient: Address = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::FeeRecipient)
+                    .expect("Fee recipient not initialized");
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &fee_recipient,
+                    &protocol_fee,
+                );
+            }
+
+            if keeper_fee > 0 {
+                let routed = Self::try_pay_keeper_via_router(
+                    env,
+                    keeper,
+                    keeper_fee,
+                    &token_address,
+                    &token_client,
+                );
+                if !routed {
+                    token_client.transfer(
+                        &env.current_contract_address(),
+                        keeper,
+                        &keeper_fee,
+                    );
+                }
+            }
+            assert_balance_invariant(env);
+        }
+
+        // Update state on success only.
+        config.last_run = now;
+        save_task(env, task_id, &config);
+        storage::record_successful_run(env, task_id, config.last_run);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TaskMeta(task_id), 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TaskPayload(task_id), 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::VrfKeeperAssignment(task_id));
+        Self::set_task_status(env, task_id, ExecutionOutcome::Success);
+
+        Ok(())
     }
 
     /// Executes an ordered [`TaskStep`] sequence across one or more dApp
@@ -9960,6 +10141,7 @@ impl SoroTaskContract {
 
 #[cfg(test)]
 mod test_gas;
+mod test_batch_execute;
 
 #[cfg(test)]
 mod test_zk;
