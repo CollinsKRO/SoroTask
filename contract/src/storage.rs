@@ -1,6 +1,6 @@
-//! Normalized task storage layout — decoupled sub-keys for gas-efficient reads.
+/// Normalized task storage layout — decoupled sub-keys for gas-efficient reads.
 
-use soroban_sdk::{Address, Env, Symbol, Vec, Val};
+use soroban_sdk::{Address, Env, Symbol, Val, Vec};
 
 use crate::DataKey;
 use crate::TaskConfig;
@@ -60,6 +60,33 @@ pub struct ExecutionLog {
     pub gas_used: i128,
 }
 
+/// Role definition for bitmask RBAC. A bitmask with a optional expiration.
+/// A delegation with `expires_at == 0` never expires.
+#[derive(Clone, Debug)]
+#[soroban_sdk::contracttype]
+pub struct RoleDelegation {
+    pub bitmask: u64,
+    pub expires_at: u64,
+}
+
+/// Bitmask permission flags (64-bit).
+/// Only the lower 32 bits are reserved for task-level permissions to keep
+/// the contract type compatible with the legacy `u32` `TaskConfig.permissions`.
+pub const ROLE_PAUSE: u64 = 1 << 0;
+pub const ROLE_UPGRADE: u64 = 1 << 1;
+pub const ROLE_FEES: u64 = 1 << 2;
+pub const ROLE_SLASHER: u64 = 1 << 3;
+
+/// Convenience constant for all defined role bits.
+pub const ROLE_ALL: u64 = ROLE_PAUSE | ROLE_UPGRADE | ROLE_FEES | ROLE_SLASHER;
+
+/// Storage key for a delegated role bitmask + expiration.
+#[derive(Clone, Debug)]
+#[soroban_sdk::contracttype]
+pub enum RoleKey {
+    Delegation(Address),
+}
+
 pub fn schema_version(env: &Env) -> u32 {
     env.storage()
         .instance()
@@ -74,15 +101,11 @@ pub fn set_schema_version(env: &Env, version: u32) {
 }
 
 pub fn has_split_layout(env: &Env, task_id: u64) -> bool {
-    env.storage()
-        .persistent()
-        .has(&DataKey::TaskMeta(task_id))
+    env.storage().persistent().has(&DataKey::TaskMeta(task_id))
 }
 
 pub fn load_legacy_task(env: &Env, task_id: u64) -> Option<TaskConfig> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Task(task_id))
+    env.storage().persistent().get(&DataKey::Task(task_id))
 }
 
 pub fn load_task_meta(env: &Env, task_id: u64) -> Option<TaskMeta> {
@@ -287,9 +310,7 @@ pub fn bump_task_ttl(env: &Env, task_id: u64) {
 
 /// Gas-optimized readiness check — loads only [`TaskMeta`], not payload.
 pub fn remove_task(env: &Env, task_id: u64) {
-    env.storage()
-        .persistent()
-        .remove(&DataKey::Task(task_id));
+    env.storage().persistent().remove(&DataKey::Task(task_id));
     env.storage()
         .persistent()
         .remove(&DataKey::TaskMeta(task_id));
@@ -306,6 +327,102 @@ pub fn check_task_ready(env: &Env, task_id: u64, now: u64) -> bool {
         return meta.is_active && now >= meta.last_run.saturating_add(meta.interval as u64);
     }
     false
+}
+
+/// -----------------------------------------------------------------------------
+	/// Bitmask Role-Based Access Control (RBAC) helpers.
+/// -----------------------------------------------------------------------------
+
+/// Return the raw delegation record for `address`, if any.
+pub fn load_role_delegation(env: &Env, address: &Address) -> Option<RoleDelegation> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Role(address.clone()))
+}
+
+/// Persist a delegation record for `address`.
+pub fn save_role_delegation(env: &Env, address: &Address, delegation: &RoleDelegation) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Role(address.clone()), delegation);
+}
+
+/// Remove a delegation record for `address`.
+pub fn remove_role_delegation(env: &Env, address: &Address) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::Role(address.clone()));
+}
+
+/// Return the effective bitmask for `address` at time `now`.
+/// Expired delegations are treated as having zero permissions.
+pub fn effective_role_bitmask(env: &Env, address: &Address, now: u64) -> u64 {
+    match load_role_delegation(env, address) {
+        Some(d) => {
+            if d.expires_at == 0 || now < d.expires_at {
+                d.bitmask
+            } else {
+                0
+            }
+        }
+        None => 0,
+    }
+}
+
+/// O1(1) bitmask check — true if `address` holds every bit in `required`.
+/// Expired delegations automatically fail because their effective bitmask is 0.
+pub fn has_role(env: &Env, address: &Address, required: u64, now: u64) -> bool {
+    if required == 0 {
+        return true;
+    }
+    let effective = effective_role_bitmask(env, address, now);
+    (effective & required) == required
+}
+
+/// Grant a bitmask delegation to `address` with an expiration timestamp.
+/// `expires_at` of 0 means no expiration. Only bits in `allowed` can be granted.
+pub fn grant_role(
+    env: &Env,
+    address: &Address,
+    bitmask: u64,
+    expires_at: u64,
+    allowed: u64,
+) -> Result<(), bool> {
+    if (bitmask & !allowed) != 0 {
+        return Err(false);
+    }
+    let delegation = RoleDelegation {
+        bitmask,
+        expires_at,
+    };
+    save_role_delegation(env, address, &delegation);
+    Ok(())
+}
+
+/// Revoke a delegation from `address`.
+pub fn revoke_role(env: &Env, address: &Address) {
+    remove_role_delegation(env, address);
+}
+
+/// -----------------------------------------------------------------------------
+	/// Cryptographic audit log emission.
+/// -----------------------------------------------------------------------------
+
+/// Emit a cryptographically bindable audit event for a role change.
+/// The event includes the actor, addresse, bitmask, expiration, and ledger sequence
+/// so off-chain consumers can reconstruct and verify the audit trail.
+pub fn emit_role_audit(
+    env: &Env,
+    actor: &Address,
+    address: &Address,
+    bitmask: u64,
+    expires_at: u64,
+    operation: Symbol,
+) {
+    env.events().publish(
+        (Symbol::new(env, "role_audit"),),
+        (actor.clone(), address.clone(), bitmask, expires_at, operation, env.ledger().sequence()),
+    );
 }
 
 /// Migrate legacy monolithic tasks to split layout (called during upgrade).

@@ -21,9 +21,7 @@ pub fn get_parent_ids(env: &Env, task_id: u64) -> Vec<u64> {
 fn load_blocked_by(env: &Env, task_id: u64) -> Vec<u64> {
     crate::storage::load_task_meta(env, task_id)
         .map(|m| m.blocked_by)
-        .or_else(|| {
-            crate::storage::load_legacy_task(env, task_id).map(|c| c.blocked_by)
-        })
+        .or_else(|| crate::storage::load_legacy_task(env, task_id).map(|c| c.blocked_by))
         .unwrap_or_else(|| Vec::new(env))
 }
 
@@ -103,11 +101,7 @@ fn set_depth(depth_map: &mut Vec<(u64, u32)>, id: u64, depth: u32) {
 }
 
 /// Validates that adding a dependency respects parent count and depth limits.
-pub fn validate_new_dependency(
-    env: &Env,
-    task_id: u64,
-    new_parent: u64,
-) -> Result<(), Error> {
+pub fn validate_new_dependency(env: &Env, task_id: u64, new_parent: u64) -> Result<(), Error> {
     if task_id == new_parent {
         return Err(Error::SelfDependency);
     }
