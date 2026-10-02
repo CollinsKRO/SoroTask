@@ -16,6 +16,11 @@ import {
   pauseTask,
   resumeTask,
   cancelTask,
+  pauseTasksBulk,
+  resumeTasksBulk,
+  cancelTasksBulk,
+  refillTasksBulk,
+  type BatchTaskResult,
   type RegisterTaskInput,
   type Task,
   type TaskFilters,
@@ -210,6 +215,87 @@ export function useCancelTask(
     onSuccess: (data, variables, onMutateResult, context) => {
       queryClient.removeQueries({ queryKey: taskKeys.detail(data.id) });
       void queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
+      options?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+  });
+}
+
+// Batch lifecycle mutations ------------------------------------------------
+//
+// These assemble ONE atomic multi-operation Soroban transaction across all
+// selected tasks, so the whole action needs a single wallet signature
+// (see frontend/app/tasks/bulk/).
+
+interface BatchLifecycleInput {
+  taskIds: string[];
+  userAddress?: string;
+  contractId?: string;
+}
+
+interface BatchRefillInput extends BatchLifecycleInput {
+  amount: string | bigint;
+}
+
+function invalidateBatch(queryClient: ReturnType<typeof useQueryClient>) {
+  void queryClient.invalidateQueries({ queryKey: taskKeys.lists() });
+  void queryClient.invalidateQueries({ queryKey: taskKeys.all });
+}
+
+export function useBatchPauseTasks(
+  options?: UseMutationOptions<BatchTaskResult[], Error, BatchLifecycleInput>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<BatchTaskResult[], Error, BatchLifecycleInput>({
+    mutationFn: ({ taskIds, userAddress, contractId }) =>
+      pauseTasksBulk(taskIds, userAddress, contractId),
+    ...options,
+    onSuccess: (data, variables, onMutateResult, context) => {
+      invalidateBatch(queryClient);
+      options?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+  });
+}
+
+export function useBatchResumeTasks(
+  options?: UseMutationOptions<BatchTaskResult[], Error, BatchLifecycleInput>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<BatchTaskResult[], Error, BatchLifecycleInput>({
+    mutationFn: ({ taskIds, userAddress, contractId }) =>
+      resumeTasksBulk(taskIds, userAddress, contractId),
+    ...options,
+    onSuccess: (data, variables, onMutateResult, context) => {
+      invalidateBatch(queryClient);
+      options?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+  });
+}
+
+export function useBatchCancelTasks(
+  options?: UseMutationOptions<BatchTaskResult[], Error, BatchLifecycleInput>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<BatchTaskResult[], Error, BatchLifecycleInput>({
+    mutationFn: ({ taskIds, userAddress, contractId }) =>
+      cancelTasksBulk(taskIds, userAddress, contractId),
+    ...options,
+    onSuccess: (data, variables, onMutateResult, context) => {
+      invalidateBatch(queryClient);
+      options?.onSuccess?.(data, variables, onMutateResult, context);
+    },
+  });
+}
+
+export function useBatchRefillTasks(
+  options?: UseMutationOptions<BatchTaskResult[], Error, BatchRefillInput>,
+) {
+  const queryClient = useQueryClient();
+  return useMutation<BatchTaskResult[], Error, BatchRefillInput>({
+    mutationFn: ({ taskIds, amount, userAddress, contractId }) =>
+      refillTasksBulk(taskIds, amount, userAddress, contractId),
+    ...options,
+    onSuccess: (data, variables, onMutateResult, context) => {
+      invalidateBatch(queryClient);
       options?.onSuccess?.(data, variables, onMutateResult, context);
     },
   });

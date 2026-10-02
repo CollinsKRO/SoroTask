@@ -154,10 +154,17 @@ async function fetchWasmFromRpc(contractId, rpcUrl) {
 // ABIRegistryService
 // ---------------------------------------------------------------------------
 
+const { TaskFlowGraph } = require('./taskFlowGraph');
+const { validateEnv } = require('./envValidator');
+const { createSigner } = require('./signer');main
+
 class ABIRegistryService {
   constructor(options = {}) {
+    validateEnv(process.env);
     this.monitor = new Monitor(parser, registry);
     this.cache = options.cache || new AbiCache(options);
+    this.taskFlowGraph = new TaskFlowGraph();
+    this.signer = options.signer || createSigner(options.signerConfig || {});
     this.indexerEvents = null;
     if (options.indexerEvents) this.attachIndexerEvents(options.indexerEvents);
   }
@@ -184,6 +191,18 @@ class ABIRegistryService {
     return errorCodes;
   }
 
+  getTaskFlowGraph() {
+    return this.taskFlowGraph;
+  }
+
+  registerTaskFlow(graph) {
+    return this.taskFlowGraph.register(graph);
+  }
+
+  exportTaskFlowToRegisterParams(graph) {
+    return this.taskFlowGraph.toRegisterParams(graph);
+  }
+
   decodeErrorCode(code) {
     return errorCodes.decodeErrorCode(code);
   }
@@ -197,7 +216,7 @@ class ABIRegistryService {
     return abi;
   }
 
-  /**
+/**
    * Downloads the WASM for `contractId` from a live Soroban RPC node,
    * parses its embedded `contractspecv0` section into a typed ABI schema,
    * stores the result in the in-memory registry, and caches it with a Redis
@@ -300,6 +319,13 @@ class ABIRegistryService {
     );
 
     return abi;
+
+getSigner() {
+    return this.signer;
+  }
+
+  async signTransaction(payload) {
+    return this.signer.sign(payload);
   }
 
   async invalidateOnIndexerEvent(event) {
@@ -319,3 +345,5 @@ module.exports = new ABIRegistryService();
 module.exports.jsonRpcPost = jsonRpcPost;
 module.exports.fetchWasmFromRpc = fetchWasmFromRpc;
 module.exports.buildContractCodeLedgerKey = buildContractCodeLedgerKey;
+
+module.exports = new ABIRegistryService({ signerConfig: { networkPassphrase: process.env.NETWORK_PASSTHRAPE || process.env.STELLAR_NETWORK_PASSTHRAPE } });
