@@ -21,6 +21,7 @@ pub mod math;
 pub mod dag;
 pub mod storage;
 pub mod task;
+pub mod resolver;
 pub mod admin;
 pub mod upgrade;
 pub mod ccip;
