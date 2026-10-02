@@ -1,6 +1,6 @@
 /// Normalized task storage layout — decoupled sub-keys for gas-efficient reads.
 
-use soroban_sdk::{Address, Env, Symbol, Vec, Val};
+use soroban_sdk::{Address, Env, Symbol, Val, Vec};
 
 use crate::DataKey;
 use crate::TaskConfig;
@@ -83,15 +83,11 @@ pub fn set_schema_version(env: &Env, version: u32) {
 }
 
 pub fn has_split_layout(env: &Env, task_id: u64) -> bool {
-    env.storage()
-        .persistent()
-        .has(&DataKey::TaskMeta(task_id))
+    env.storage().persistent().has(&DataKey::TaskMeta(task_id))
 }
 
 pub fn load_legacy_task(env: &Env, task_id: u64) -> Option<TaskConfig> {
-    env.storage()
-        .persistent()
-        .get(&DataKey::Task(task_id))
+    env.storage().persistent().get(&DataKey::Task(task_id))
 }
 
 pub fn load_task_meta(env: &Env, task_id: u64) -> Option<TaskMeta> {
@@ -227,9 +223,7 @@ pub fn record_successful_run(env: &Env, task_id: u64, last_run: u64) {
 
 /// Gas-optimized readiness check — loads only [`TaskMeta`], not payload.
 pub fn remove_task(env: &Env, task_id: u64) {
-    env.storage()
-        .persistent()
-        .remove(&DataKey::Task(task_id));
+    env.storage().persistent().remove(&DataKey::Task(task_id));
     env.storage()
         .persistent()
         .remove(&DataKey::TaskMeta(task_id));

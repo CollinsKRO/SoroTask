@@ -10,8 +10,7 @@ pub use crate::storage::check_task_ready;
 
 /// Returns whether a task exists (split or legacy layout).
 pub fn task_exists(env: &Env, task_id: u64) -> bool {
-    storage::has_split_layout(env, task_id)
-        || storage::load_legacy_task(env, task_id).is_some()
+    storage::has_split_layout(env, task_id) || storage::load_legacy_task(env, task_id).is_some()
 }
 
 pub fn get_meta(env: &Env, task_id: u64) -> Option<TaskMeta> {

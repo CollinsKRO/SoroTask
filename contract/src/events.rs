@@ -427,12 +427,7 @@ impl EventLogger {
 
     /// Logs a task invalidation event when an upstream protocol upgrade
     /// causes a registered task to become invalid.
-    pub fn log_task_invalidated(
-        env: &Env,
-        task_id: u64,
-        target_contract: Address,
-        reason: Symbol,
-    ) {
+    pub fn log_task_invalidated(env: &Env, task_id: u64, target_contract: Address, reason: Symbol) {
         let timestamp = env.ledger().timestamp();
         let event_data = TaskInvalidatedEvent {
             task_id,

@@ -5,1199 +5,20 @@ pub mod access;
 pub mod packed_args;
 pub mod events;
 pub use events::*;
-pub mod math;
+pub mod admin;
 pub mod dag;
+pub mod math;
 pub mod storage;
 pub mod task;
+pub mod upgrade;
+pub mod zk;
 pub mod resolver;
 pub mod mempool;
 pub mod ccip;
 pub mod admin;
-pub mod upgrade;
 pub mod security;
 #[cfg(test)]
 mod test_commit_reveal;
-
-pub use storage::{TaskMeta, TaskPayload, TaskStats};
-pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
-
-/// Pending execution commitment posted by a keeper in the commit phase.
-/// Stores the hash of (keeper_address, task_id, secret, block_target)
-/// so the on-chain commitment cannot be front-run from the mempool.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ExecutionCommitment {
-    /// The keeper that posted this commitment
-    pub keeper: Address,
-    /// Task this commitment is for
-    pub task_id: u64,
-    /// SHA-256 of (keeper_xdr || task_id_le8 || secret || block_target_le4)
-    pub commitment_hash: BytesN<32>,
-    /// Ledger sequence at which the commitment was posted
-    pub commit_ledger: u32,
-    /// Bond amount locked (returned on successful reveal, forfeited on expiry)
-    pub bond_amount: i128,
-}
-
-/// Number of ledgers within which the keeper must reveal after committing.
-pub const COMMIT_REVEAL_WINDOW_LEDGERS: u32 = 3;
-
-/// Minimum bond a keeper must post with a commit (prevents spam).
-pub const MIN_COMMIT_BOND: i128 = 10;
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Val, Vec,
-};
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    InvalidInterval = 1,
-    Unauthorized = 2,
-    InsufficientBalance = 3,
-    NotInitialized = 4,
-    TaskPaused = 5,
-    TaskAlreadyPaused = 6,
-    TaskAlreadyActive = 7,
-    SelfDependency = 8,
-    DependencyNotFound = 9,
-    CircularDependency = 10,
-    DependencyBlocked = 11,
-    AlreadyInitialized = 12,
-    UnauthorizedSlasher = 13,
-    KeeperStakeTooLow = 14,
-    OperatorAlreadySet = 15,
-    InvalidPayload = 16,
-    ReentrantCall = 17,
-    DependencyLimitExceeded = 18,
-    DependencyDepthExceeded = 19,
-    VrfOracleNotSet = 20,
-    InvalidVrfRequest = 21,
-    VrfRequestFailed = 22,
-    VrfAlreadyFulfilled = 23,
-    YieldStrategyNotInitialized = 24,
-    InvalidYieldStrategy = 25,
-    YieldHarvestFailed = 26,
-    InsufficientYield = 27,
-    OracleNotSet = 28,
-    OracleRequestFailed = 29,
-    OracleInvalidResponse = 30,
-    OracleTimeout = 31,
-    OracleUnsupportedProvider = 32,
-    InvalidInsurancePolicy = 33,
-    ArgsTooMany = 34,
-    ArgsTooLarge = 35,
-    TaskNotFound = 36,
-    InvalidUpgradeVersion = 37,
-    DuplicateTask = 38,
-    BountyBelowMinimum = 39,
-    InvalidBounty = 40,
-    FeatureDisabled = 41,
-    InvalidZkProof = 42,
-    FlashSwapFailed = 43,
-    InsufficientFlashProfit = 44,
-    InvalidSlippage = 45,
-    OptimisticClaimPending = 46,
-    NoOptimisticClaim = 47,
-    ChallengeWindowClosed = 48,
-    ChallengeWindowActive = 49,
-    FraudProofInvalid = 50,
-    EmptyBundle = 51,
-    BundleTooLarge = 52,
-    BundleStepFailed = 53,
-    BlockExecutionLimitReached = 54,
-    DecryptionFailed = 55,
-    InsufficientDelegation = 56,
-    InvalidCommissionRate = 57,
-    InvalidVdfProof = 58,
-    UpgradeNotProposed = 59,
-    UpgradeTimelockActive = 60,
-    // Oracle freshness / multi-oracle errors (Issues #1040, #1041)
-    OracleStale = 411,
-    OracleDeviationExceeded = 412,
-    InsufficientOracleFeeds = 413,
-    // VRF commit-reveal errors (Issue #1042)
-    VrfFulfillmentTooEarly = 414,
-    VrfFulfillmentExpired = 415,
-    VrfCommitAlreadyRevealed = 416,
-    InvalidVrfCommit = 417,
-    // Keeper bonding errors (Issue #1043)
-    KeeperBondInsufficient = 418,
-    KeeperSlashed = 419,
-    KeeperNotBonded = 420,
-    VolatilityExceeded = 600,
-    VolatilityCircuitBreakerTripped = 601,
-    VolatilityTimelockActive = 602,
-    UnpauseNotProposed = 65,
-    UnpauseTimelockActive = 66,
-    InvalidPauseThreshold = 67,
-    TaskStillActive = 68,
-    AbandonmentPeriodNotElapsed = 69,
-    // Cross-chain errors
-    UnsupportedSourceChain = 700,
-    InvalidCrossChainPayload = 701,
-    InvalidCrossChainSignature = 702,
-    GatewayNotConfigured = 703,
-    GatewayUnauthorized = 704,
-    CrossChainNonceReplay = 705,
-    MessageAlreadyExecuted = 706,
-    // Commit-reveal execution protocol errors (SC-HARD-07)
-    CommitmentRequired = 800,
-    CommitmentAlreadyExists = 801,
-    CommitmentMismatch = 802,
-    RevealWindowExpired = 803,
-    CommitmentNotFound = 804,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum OracleProvider {
-    Chainlink,
-    Band,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleConfig {
-    pub address: Address,
-    pub provider: OracleProvider,
-    pub active: bool,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum OracleRequestStatus {
-    Pending,
-    Fulfilled,
-    Failed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleDataRequest {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub requester: Address,
-    pub provider: OracleProvider,
-    pub job_id: Symbol,
-    pub callback_function: Symbol,
-    pub callback_args: Vec<Val>,
-    pub status: OracleRequestStatus,
-    pub created_at: u64,
-    pub max_retries: u32,
-    pub retry_count: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleDataResponse {
-    pub request_id: u64,
-    pub data: Bytes,
-    pub timestamp: u64,
-    pub provider: OracleProvider,
-}
-
-/// An individual oracle price feed entry for multi-oracle aggregation (Issue #1041).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleFeed {
-    pub provider: OracleProvider,
-    pub price: i128,
-    pub timestamp: u64,
-    pub decimals: u32,
-}
-
-/// A committed VRF seed for the commit-reveal scheme (Issue #1042).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfCommit {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub commit_hash: BytesN<32>,
-    pub committed_by: Address,
-    pub committed_at_ledger: u32,
-    pub revealed: bool,
-}
-
-/// Keeper economic bond record (Issue #1043).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperBond {
-    pub keeper: Address,
-    pub bonded_amount: i128,
-    pub bonded_at: u64,
-    pub is_slashed: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProxyConfig {
-    pub admin: Address,
-    pub version: u32,
-    pub implementation_hash: Option<BytesN<32>>,
-    pub upgrade_count: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct UpgradeRecord {
-    pub previous_version: u32,
-    pub new_version: u32,
-    pub implementation_hash: BytesN<32>,
-    pub upgraded_by: Address,
-    pub upgraded_at: u64,
-}
-pub trait AddressExt {
-    fn current(env: &Env) -> Address;
-}
-
-impl AddressExt for Address {
-    fn current(env: &Env) -> Address {
-        env.current_contract_address()
-    }
-}
-
-/// Maximum number of arguments allowed in a task payload
-const MAX_ARGS_COUNT: u32 = 32;
-
-/// Maximum serialized size of arguments in bytes (approx 4KB limit for Soroban)
-const MAX_ARGS_SIZE_BYTES: u32 = 4096;
-
-const FIXED_EXECUTION_FEE: i128 = 100;
-const MAX_DEPENDENCIES_PER_TASK: u32 = 8;
-const MAX_DEPENDENCY_DEPTH: u32 = 5;
-/// Maximum number of tasks allowed per ledger block for rate limiting
-const MAX_TASKS_PER_BLOCK: u32 = 50;
-/// Maximum number of tasks allowed in a single batch execution
-const MAX_BATCH_SIZE: u32 = 100;
-
-/// Maximum number of steps allowed in a single atomic task bundle
-const MAX_BUNDLE_STEPS: u32 = 16;
-
-// ── Cross-Chain Interoperability Protocol (CCIP) Gateway (Issue #814) ──────
-/// Maximum allowed payload size for cross-chain messages (bytes)
-const MAX_CROSS_CHAIN_PAYLOAD_SIZE: u32 = 4096;
-/// Maximum age (seconds) of a cross-chain message before it is considered stale
-const CROSS_CHAIN_MAX_MESSAGE_AGE: u64 = 3_600;
-/// Number of confirmations required on the source chain
-const CROSS_CHAIN_MIN_CONFIRMATIONS: u64 = 1;
-/// Ledgers a submitted optimistic resolver-condition claim stays open to
-/// challenge before it can be finalized.
-const OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS: u32 = 100;
-/// Minimum bond a keeper must post to submit an optimistic claim.
-const MIN_OPTIMISTIC_BOND: i128 = 100;
-
-/// Maximum age in seconds for oracle price feed data before it is considered stale (Issue #1040).
-const MAX_ORACLE_DELAY_SECONDS: u64 = 300;
-
-/// Maximum deviation between oracle feeds in basis points before halting execution (Issue #1041).
-const MAX_ORACLE_DEVIATION_BPS: u32 = 250;
-
-/// Default delay seconds for VRF commit-reveal (Issue #1042). Admin can override.
-/// Defaults to 0 (disabled) to preserve backward compatibility.
-const DEFAULT_VRF_DELAY_SECONDS: u64 = 0;
-
-/// Default expiration seconds for VRF fulfillment window (Issue #1042). Admin can override.
-/// Defaults to 0 (disabled) to preserve backward compatibility.
-const DEFAULT_VRF_EXPIRATION_SECONDS: u64 = 0;
-
-/// Minimum stake a keeper must bond to claim restricted tasks (Issue #1043), in token units.
-const MIN_KEEPER_STAKE: i128 = 500;
-
-/// State Archival TTL Extension Thresholds (Issue #1031)
-pub const MIN_THRESHOLD_LEDGERS: u32 = 100_000;
-pub const EXTEND_TO_LEDGERS: u32 = 500_000;
-/// Delay between a governance-approved unpause proposal reaching quorum and
-/// when it becomes executable via `execute_unpause` (Issue #774).
-pub const UNPAUSE_TIMELOCK_SECONDS: u64 = 86_400;
-
-/// Permission Bitmask Flags for Task RBAC
-pub const PERM_CAN_PAUSE: u32 = 1;
-pub const PERM_CAN_UPDATE: u32 = 2;
-pub const PERM_CAN_CANCEL: u32 = 4;
-pub const PERM_CAN_DEPOSIT: u32 = 8;
-
-/// Issue #777: minimum time an inactive task must sit untouched (since
-/// `last_run`) before anyone (not just the creator) may permissionlessly
-/// trigger `refund_inactive_task` and reclaim its locked gas deposit. Set
-/// well above any legitimate pause-then-resume workflow so a creator who
-/// pauses a task and comes back a day later never has it refunded out
-/// from under them.
-pub const INACTIVE_TASK_ABANDONMENT_SECONDS: u64 = 60 * 60 * 24 * 90; // 90 days
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskConfig {
-    pub creator: Address,
-    pub target: Address,
-    pub function: Symbol,
-    pub args: Vec<Val>,
-    pub resolver: Option<Address>,
-    /// Minimum seconds between executions. `u32` is sufficient here (max
-    /// ~136 years) - unlike `last_run`, which is a ledger timestamp and must
-    /// stay `u64` to match `env.ledger().timestamp()`.
-    pub interval: u32,
-    pub last_run: u64,
-    pub gas_balance: i128,
-    pub whitelist: Vec<Address>,
-    pub is_active: bool,
-    pub blocked_by: Vec<u64>,
-    /// Optional yield strategy ID for automated yield harvesting
-    pub yield_strategy: Option<u64>,
-    /// Gas-optimized bitmask vector for role-based permissions
-    pub permissions: u32,
-}
-
-/// A single invocation within a [`TaskBundle`]: `target::function(args)`.
-///
-/// When `forward_result` is `true`, the `Val` returned by this step's
-/// invocation is appended as the final argument of the *next* step's `args`,
-/// letting one dApp call (e.g. a DEX swap) feed its output into the next
-/// (e.g. a lending deposit).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskStep {
-    pub target: Address,
-    pub function: Symbol,
-    pub args: Vec<Val>,
-    pub forward_result: bool,
-}
-
-/// Per-step outcome recorded after an atomic bundle execution completes,
-/// for off-chain introspection of what each leg of the bundle returned.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BundleStepOutcome {
-    pub target: Address,
-    pub function: Symbol,
-    pub succeeded: bool,
-}
-
-/// Record of a completed atomic multi-task bundle execution.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BundleExecutionRecord {
-    pub bundle_id: u64,
-    pub initiator: Address,
-    pub timestamp: u64,
-    pub steps: Vec<BundleStepOutcome>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskDependency {
-    pub task_id: u64,
-    pub depends_on: u64,
-}
-
-/// Encrypted parameter payload for privacy-preserving task execution.
-/// The ciphertext is encrypted with the contract's public key and can
-/// only be decrypted in-memory during execution.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EncryptedPayload {
-    /// The encrypted ciphertext of the parameter
-    pub ciphertext: Bytes,
-    /// The nonce used for encryption
-    pub nonce: BytesN<24>,
-    /// The public key of the encryption scheme
-    pub public_key: BytesN<32>,
-    /// The encryption scheme identifier (e.g. "kyber", "ml-kem")
-    pub encryption_scheme: Symbol,
-}
-
-/// Invalidation hook registration for upstream protocol upgrade detection.
-/// When a target contract upgrades its WASM logic, the hook is triggered
-/// to pause or re-validate the associated task.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct InvalidationHook {
-    /// The target contract address that this hook monitors
-    pub target_contract: Address,
-    /// The callback function name to invoke on the target contract
-    /// when an upgrade is detected
-    pub callback_fn: Symbol,
-    /// Timestamp when the hook was registered
-    pub registered_at: u64,
-    /// Whether the hook is currently active
-    pub is_active: bool,
-}
-
-/// Delegation pool entry mapping a delegator to a keeper operator.
-/// Token holders can delegate stake to trusted keepers and earn a share
-/// of execution bounties minus the operator commission.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct DelegationPool {
-    /// The address of the delegator
-    pub delegator: Address,
-    /// The address of the keeper operator
-    pub keeper: Address,
-    /// The amount of stake delegated
-    pub amount: i128,
-    /// The operator commission rate in basis points (0-10000)
-    pub commission_rate: u32,
-    /// Timestamp when the delegation was created
-    pub created_at: u64,
-    /// Whether the delegation is active
-    pub is_active: bool,
-}
-
-/// Per-block execution tracking record for rate limiting.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BlockExecutionRecord {
-    /// The ledger sequence number this record corresponds to
-    pub ledger_sequence: u32,
-    /// The number of task executions in this block
-    pub execution_count: u32,
-}
-
-/// State channel configuration
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannel {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Participants in the channel
-    pub participants: Vec<Address>,
-    /// Current balances for each participant
-    pub balances: Vec<i128>,
-    /// Last settlement timestamp
-    pub last_settlement: u64,
-    /// Settlement interval (in seconds)
-    pub settlement_interval: u64,
-    /// Is the channel active
-    pub is_active: bool,
-    /// Channel nonce for update verification
-    pub nonce: u64,
-}
-
-/// State channel update containing off-chain computation results
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannelUpdate {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Update nonce (must be greater than previous nonce)
-    pub nonce: u64,
-    /// Hash of the updated state
-    pub state_hash: Bytes,
-    /// Micro-tasks to execute as part of this settlement
-    pub micro_tasks: Vec<ExecutableTask>,
-    /// Timestamp of the update
-    pub updated_at: u64,
-    /// Signature from participants (for verification)
-    pub signature: Bytes,
-}
-
-/// State channel settlement record
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannelSettlement {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Settlement ID
-    pub settlement_id: u64,
-    /// Nonce used for this settlement
-    pub nonce: u64,
-    /// Timestamp of settlement
-    pub settled_at: u64,
-    /// Tasks executed during settlement
-    pub executed_tasks: Vec<u64>,
-    /// Settlement fee paid
-    pub settlement_fee: i128,
-}
-
-/// Verifiable Delay Function (VDF) proof struct for un-cheatable execution delays
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct VdfProof {
-    pub output: Bytes,
-    pub difficulty: u64,
-    pub seed: Bytes,
-}
-
-/// Role enumeration for granular access control
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Role {
-    Admin,
-    Keeper,
-    Delegate,
-    Viewer,
-    Auditor,
-}
-
-/// Permission enumeration for fine-grained access control
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Permission {
-    TaskCreate,
-    TaskExecute,
-    TaskManage,
-    PortfolioManage,
-    GovernanceVote,
-    GovernancePropose,
-    KeeperRegister,
-    KeeperDelegated,
-    AdminAccess,
-}
-
-/// Role assignment for an address
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct RoleAssignment {
-    /// Address that has been assigned a role
-    pub address: Address,
-    /// The role assigned to this address
-    pub role: Role,
-    /// Timestamp when the role was assigned
-    pub assigned_at: u64,
-    /// Optional expiration timestamp (0 for no expiration)
-    pub expires_at: u64,
-}
-
-/// Permission grant for specific permissions
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct PermissionGrant {
-    /// Address that has been granted permissions
-    pub address: Address,
-    /// List of permissions granted
-    pub permissions: Vec<Permission>,
-    /// Timestamp when permissions were granted
-    pub granted_at: u64,
-    /// Optional expiration timestamp (0 for no expiration)
-    pub expires_at: u64,
-}
-
-/// Delegation record for permission delegation
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Delegation {
-    /// Address that delegated permissions
-    pub delegator: Address,
-    /// Address that received delegated permissions
-    pub delegatee: Address,
-    /// List of permissions delegated
-    pub permissions: Vec<Permission>,
-    /// Timestamp when delegation was created
-    pub created_at: u64,
-    /// Expiration timestamp for delegation
-    pub expires_at: u64,
-    /// Whether delegation is revocable
-    pub is_revocable: bool,
-}
-
-/// Keeper reputation tracking structure
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperReputation {
-    /// Address of the keeper
-    pub address: Address,
-    /// Current reputation score (0-1000 scale)
-    pub score: u64,
-    /// Total number of task executions attempted
-    pub execution_count: u64,
-    /// Number of successful task executions
-    pub success_count: u64,
-    /// Number of failed task executions
-    pub failure_count: u64,
-    /// Timestamp of last reputation update
-    pub last_updated: u64,
-    /// Optional notes about reputation history
-    pub notes: Bytes,
-}
-
-/// Keeper reputation history record
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperReputationHistory {
-    /// Address of the keeper
-    pub address: Address,
-    /// Reputation score at this point in time
-    pub score: u64,
-    /// Timestamp of this reputation snapshot
-    pub timestamp: u64,
-    /// Reason for reputation change
-    pub reason: Bytes,
-    /// Previous score before change
-    pub previous_score: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionOutcome {
-    NeverRun,
-    Success,
-    Failed,
-    Skipped,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskExecutionStatus {
-    pub outcome: ExecutionOutcome,
-    pub completed_at: u64,
-    pub run_count: u64,
-}
-
-/// On-chain record of the execution trace for one task run.
-/// Stored so off-chain consumers can retrieve the full step-by-step
-/// path and identify exactly which condition caused a failure.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionTrace {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub timestamp: u64,
-    pub steps: Vec<events::ExecutionStepRecord>,
-    pub final_outcome: ExecutionOutcome,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DependencyOutcome {
-    AnyCompletion,
-    Success,
-    Skipped,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DependencyRule {
-    pub task_id: u64,
-    pub required_outcome: DependencyOutcome,
-    pub min_completed_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Portfolio {
-    pub creator: Address,
-    pub name: Bytes,
-    pub description: Bytes,
-    pub created_at: u64,
-    pub is_active: bool,
-    pub task_count: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PortfolioOperation {
-    Pause,
-    Resume,
-    Fund,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StakingPool {
-    pub total_staked: i128,
-    pub stakers_count: u64,
-    pub reward_rate: i128,
-    pub last_reward_timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-/// Portfolio statistics and analytics
-pub struct PortfolioStatistics {
-    /// Portfolio ID
-    pub portfolio_id: u64,
-    /// Total number of tasks in portfolio
-    pub task_count: u64,
-    /// Number of active tasks
-    pub active_task_count: u64,
-    /// Total number of task executions
-    pub total_executions: u64,
-    /// Timestamp of last task execution
-    pub last_execution_timestamp: u64,
-    /// Portfolio creation timestamp
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-/// Configuration for yield harvesting strategies
-pub struct YieldStrategyConfig {
-    /// Address of the DeFi protocol contract to harvest from
-    pub protocol_address: Address,
-    /// Function name to call for harvesting
-    pub harvest_function: Symbol,
-    /// Function name to call for compounding
-    pub compound_function: Symbol,
-    /// Additional arguments for harvest function
-    pub harvest_args: Vec<Val>,
-    /// Additional arguments for compound function
-    pub compound_args: Vec<Val>,
-    /// Minimum yield threshold to trigger harvest
-    pub min_yield_threshold: i128,
-    /// Maximum gas fee allowed for harvest operation
-    pub max_gas_fee: i128,
-    /// Strategy creation timestamp
-    pub created_at: u64,
-    /// Whether strategy is active
-    pub is_active: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StakingBalance {
-    pub address: Address,
-    pub amount: i128,
-    pub last_stake_timestamp: u64,
-    pub accumulated_rewards: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct GovernanceProposal {
-    pub proposer: Address,
-    pub title: Bytes,
-    pub description: Bytes,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub status: ProposalStatus,
-    pub votes_for: i128,
-    pub votes_against: i128,
-    pub quorum: i128,
-    pub proposal_type: ProposalType,
-    pub payload: Vec<Val>,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ProposalType {
-    UpdateTokenomicsConfig,
-    UpdateFeeModel,
-    UpdateStakingParameters,
-    Other,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ProposalStatus {
-    Active,
-    Passed,
-    Rejected,
-    Executed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VotingPower {
-    pub address: Address,
-    pub voting_power: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TokenomicsConfig {
-    pub staking_reward_rate: i128,
-    pub governance_quorum_percentage: i128,
-    pub governance_voting_period: u64,
-    pub fee_model: FeeModel,
-    pub min_fee: i128,
-    pub max_fee: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct NetworkMetrics {
-    pub last_24h_transaction_count: u64,
-    pub avg_gas_price_last_hour: i128,
-    pub current_congestion_level: u32, // 0-100 scale
-    pub last_updated: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperMetrics {
-    pub active_keepers_count: u64,
-    pub total_keepers_registered: u64,
-    pub avg_response_time_ms: u64,
-    pub last_updated: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FeeModel {
-    Fixed,
-    Percentage,
-    Dynamic,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfRequest {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub requester: Address,
-    pub callback_function: Symbol,
-    pub callback_args: Vec<Val>,
-    pub status: VrfRequestStatus,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum VrfRequestStatus {
-    Pending,
-    Fulfilled,
-    Failed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfResponse {
-    pub request_id: u64,
-    pub random_number: i128,
-    pub proof: Bytes,
-    pub fulfilled_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfKeeperAssignment {
-    pub task_id: u64,
-    pub request_id: u64,
-    pub keepers: Vec<Address>,
-    pub winner: Option<Address>,
-    pub random_number: Option<i128>,
-    pub requested_at: u64,
-    pub fulfilled_at: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ClaimStatus {
-    Active,
-    Submitted,
-    Paid,
-    Rejected,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct InsurancePolicy {
-    pub policy_id: u64,
-    pub owner: Address,
-    pub task_id: u64,
-    pub premium_paid: i128,
-    pub coverage_amount: i128,
-    pub status: ClaimStatus,
-    pub created_at: u64,
-    pub failure_reason: Bytes,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ZkCondition {
-    pub task_id: u64,
-    pub condition_hash: Bytes,
-    pub zk_proof: Bytes,
-    pub verifier_address: Address,
-    pub created_at: u64,
-    pub is_verified: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EmergencyPauseState {
-    pub is_paused: bool,
-    pub paused_at: u64,
-    pub pause_duration: u64,
-}
-
-// Feature flag bitmask constants
-pub const FEATURE_YIELD_STRATEGY: u32 = 1 << 0;
-pub const FEATURE_FLASH_LOAN: u32 = 1 << 1;
-pub const FEATURE_VRF: u32 = 1 << 2;
-pub const FEATURE_INSURANCE: u32 = 1 << 3;
-pub const FEATURE_STATE_CHANNEL: u32 = 1 << 4;
-pub const FEATURE_ZK_RANGE_PROOF: u32 = 1 << 5;
-pub const DEFAULT_FEATURE_FLAGS: u32 = 0xFFFFFFFF;
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ZkRangeProof {
-    pub task_id: u64,
-    pub min_val: i128,
-    pub max_val: i128,
-    pub commitment: BytesN<32>,
-    pub proof: Bytes,
-    pub verifier: Address,
-    pub is_verified: bool,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct DynamicBountyConfig {
-    pub enabled: bool,
-    pub base_bounty: i128,
-    pub interval: u32,
-    pub max_multiplier_bps: u32,
-    pub growth_rate_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct FlashSwapParams {
-    pub dex_router: Address,
-    pub token_borrow: Address,
-    pub amount_borrow: i128,
-    pub token_repay: Address,
-    pub min_profit: i128,
-    pub flash_fee_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct FlashSwapExecution {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub params: FlashSwapParams,
-    pub profit: i128,
-    pub timestamp: u64,
-}
-
-/// A keeper's standing preference for how their execution fee is paid out.
-/// When set, `PayKeeper` routes the fee through `router` into `payout_token`
-/// instead of paying it in the contract's single global gas token.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeeperPayoutPreference {
-    pub payout_token: Address,
-    pub router: Address,
-    /// Maximum acceptable slippage in basis points (0-10000) applied to the
-    /// router's quoted output when deriving `min_amount_out` for the swap.
-    pub max_slippage_bps: u32,
-}
-
-/// An optimistically-submitted resolver condition claim, bonded by the
-/// submitting keeper and open to challenge for `OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS`.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OptimisticExecution {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub bond: i128,
-    pub claimed_condition_result: bool,
-    pub submitted_at_ledger: u32,
-    pub resolved: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RandomSeedRotation {
-    pub current_seed: BytesN<32>,
-    pub last_updated_ledger: u32,
-    pub last_updated_timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InsuranceSolvencyReport {
-    pub total_vault_balance: i128,
-    pub target_reserve: i128,
-    pub solvency_ratio_bps: u32,
-    pub is_solvent: bool,
-}
-
-/// Supported cross-chain source networks for the CCIP Trigger Gateway.
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum CrossChainSource {
-    Ethereum = 1,
-    Solana = 2,
-    Polygon = 3,
-    Bsc = 4,
-}
-
-/// Decoded cross-chain task payload emitted with the `CrossChainTaskScheduled` event.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct CrossChainTaskPayload {
-    pub task_id: u64,
-    pub source_chain: Symbol,
-    pub sender: Bytes,
-    pub nonce: u64,
-    pub received_at: u64,
-}
-
-/// Persistent record of a received cross-chain task, stored for audit and query.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct CrossChainTaskRecord {
-    pub task_id: u64,
-    pub source_chain: Symbol,
-    pub sender: Bytes,
-    pub nonce: u64,
-    pub received_at: u64,
-}
-
-#[contracttype]
-pub enum DataKey {
-    Guardians,
-    PauseSignatures,
-    EmergencyPauseState,
-    /// Configurable K-of-N threshold for `emergency_pause` guardian signatures (Issue #774)
-    PauseThreshold,
-    /// Timestamp at which a pending governance-approved unpause becomes executable
-    UnpauseTimelock,
-    /// Whether a governance unpause proposal is currently pending
-    UnpauseProposed,
-    Task(u64),
-    TaskMeta(u64),
-    TaskPayload(u64),
-    /// Leaky bucket keyed by target contract address (Issue #1192).
-    TargetInvocationBucket(Address),
-    TaskStats(u64),
-    StorageSchemaVersion,
-    UpgradeProposal,
-    /// Per-task delegated permission bitmask for a non-creator address
-    /// (Issue #778). Same bit layout as `TaskConfig.permissions`
-    /// (`PERM_CAN_PAUSE` etc.) — absence means no delegated access.
-    TaskDelegate(u64, Address),
-    Counter,
-    ActiveTasks,
-    Token,
-    Operator,
-    KeeperStake(Address),
-    TaskDependencies(u64),
-    TaskStatus(u64),
-    DependencyRules(u64),
-    /// Existence marker keyed by `task_fingerprint(creator, target, function, args, interval)`,
-    /// used to reject duplicate registrations. See `register`/`cancel_task`.
-    TaskFingerprint(BytesN<32>),
-    Portfolio(u64),
-    PortfolioTasks(u64),
-    PortfolioCounter,
-    StakingPool,
-    StakingBalance(Address),
-    GovernanceProposal(u64),
-    GovernanceProposalCounter,
-    GovernanceVotingPower(Address),
-    TokenomicsConfig,
-    FeeRecipient,
-    ProtocolFeeBps,
-    VrfOracleAddress,
-
-    VrfRequestCounter,
-    VrfRequests(u64),
-    VrfResponses(u64),
-    VrfKeeperAssignment(u64),
-    OracleConfig(OracleProvider),
-    OracleRequestCounter,
-    OracleRequests(u64),
-    OracleResponses(u64),
-    InsurancePolicyCounter,
-    InsurancePolicy(u64),
-    YieldStrategyCounter,
-    YieldStrategies(u64),
-    ReentrancyLock,
-    ZkConditions(u64),
-    ZkConditionCounter,
-    NetworkMetrics,
-    KeeperMetrics,
-    AdminAddress,
-    ProxyConfig,
-    UpgradeRecord(u64),
-    StateChannel(u64),
-    StateChannelCounter,
-    StateChannelUpdates(u64),
-    StateChannelUpdateCounter,
-    StateChannelSettlements(u64),
-    StateChannelSettlementCounter,
-    RoleAssignments(Address),
-    PermissionGrants(Address),
-    Delegations(Address),
-    VoteDelegation(Address),
-    RoleAssignmentCounter,
-    PermissionGrantCounter,
-    DelegationCounter,
-    KeeperReputation(Address),
-    KeeperReputationCounter,
-    ExecutionTrace(u64),
-    MinBounty,
-    FeatureFlags,
-    KeeperPayoutPreference(Address),
-    OptimisticExecution(u64),
-    ZkRangeProofs(u64),
-    ZkRangeProofCounter,
-    TaskDynamicBounty(u64),
-    FlashSwapRecord(u64),
-    MaxVolatilityBps,
-    LastOraclePrice,
-    VolatilityCircuitBreakerTripped,
-    VolatilityUnpauseTimelock,
-    FlashSwapCounter,
-    KeeperRandomSeed,
-    InsuranceVaultBalance,
-    InsuranceTargetReserve,
-    VdfProofCounter,
-    VdfProofs(u64),
-    /// Per-block execution counter for rate limiting (Issue #831)
-    BlockExecutionCount,
-    /// Cumulative user execution count for fee discount tiers (Issue #826)
-    UserExecutionCount(Address),
-    /// Last ledger sequence number tracked for rate limiting
-    LastBlockLedger,
-    /// Maximum tasks per block configuration
-    MaxTasksPerBlock,
-    /// Invalidation hook storage (Issue #832)
-    InvalidationHookCounter,
-    InvalidationHooks(u64),
-    /// Encrypted payload storage (Issue #833)
-    EncryptedPayload(u64),
-    /// Delegation pool storage (Issue #836)
-    DelegationPool(Address),
-    DelegationPoolCounter,
-    /// Keeper commission rate in basis points
-    KeeperCommission(Address),
-    /// List of delegator addresses for a given keeper
-    KeeperDelegators(Address),
-    /// Total delegated amount for a given keeper
-    KeeperTotalDelegated(Address),
-    BundleCounter,
-    BundleExecution(u64),
-    /// Multi-oracle price feeds (Issue #1041)
-    OracleFeed(OracleProvider),
-    OracleFeedCount,
-    /// VRF commit-reveal storage (Issue #1042)
-    VrfCommit(u64),
-    /// Keeper economic bond storage (Issue #1043)
-    KeeperBond(Address),
-    /// Whitelist of keepers allowed to claim restricted tasks
-    RestrictedTaskKeepers,
-    /// Whether a task requires bonded keepers (Issue #1043)
-    TaskRequiresBond(u64),
-    /// Configurable VRF delay in seconds (Issue #1042)
-    VrfDelaySeconds,
-    /// Configurable VRF expiration in seconds (Issue #1042)
-    VrfExpirationSeconds,
-    TotalTaskEscrows,
-    TotalKeeperStakes,
-    TotalUnclaimedFees,
-    /// Cross-chain gateway: relayer address authorized to relay messages
-    CrossChainGatewayRelayer,
-    /// Cross-chain gateway: per-chain nonce tracking (replay protection)
-    CrossChainNonce(u32, u64),
-    /// Cross-chain gateway: per-chain nonce counter
-    CrossChainNonceCounter(u32),
-    /// Cross-chain gateway: received task records
-    CrossChainTaskRecord(u64),
-    /// Cross-chain gateway: global received task counter
-    CrossChainTaskCounter,
-    /// Cross-chain gateway: per-chain enabled flag
-    CrossChainSourceEnabled(u32),
-    /// Commit-reveal: pending commitment keyed by task_id (SC-HARD-07)
-    ExecutionCommitment(u64),
 }
 
 fn enter_security_guard(env: &Env) {
@@ -1484,7 +305,11 @@ fn set_total_unclaimed_fees(env: &Env, amount: i128) {
 }
 
 fn assert_balance_invariant(env: &Env) {
-    if let Some(token_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::Token) {
+    if let Some(token_address) = env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Token)
+    {
         let token_client = soroban_sdk::token::Client::new(env, &token_address);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let total_task_escrows = get_total_task_escrows(env);
@@ -2060,10 +885,7 @@ impl SoroTaskContract {
             .get::<DataKey, EmergencyPauseState>(&DataKey::EmergencyPauseState)
         {
             if state.is_paused {
-                if env
-                    .ledger()
-                    .timestamp()
-                    >= state.paused_at.saturating_add(state.pause_duration)
+                if env.ledger().timestamp() >= state.paused_at.saturating_add(state.pause_duration)
                 {
                     state.is_paused = false;
                     env.storage()
@@ -2129,7 +951,10 @@ impl SoroTaskContract {
         }
 
         if sigs.len() >= Self::pause_threshold(&env) {
-            let timelock = env.ledger().timestamp().saturating_add(UNPAUSE_TIMELOCK_SECONDS);
+            let timelock = env
+                .ledger()
+                .timestamp()
+                .saturating_add(UNPAUSE_TIMELOCK_SECONDS);
             env.storage()
                 .persistent()
                 .set(&DataKey::UnpauseTimelock, &timelock);
@@ -2300,7 +1125,8 @@ impl SoroTaskContract {
 
         config.is_active = true;
         if config.permissions == 0 {
-            config.permissions = PERM_CAN_PAUSE | PERM_CAN_UPDATE | PERM_CAN_CANCEL | PERM_CAN_DEPOSIT;
+            config.permissions =
+                PERM_CAN_PAUSE | PERM_CAN_UPDATE | PERM_CAN_CANCEL | PERM_CAN_DEPOSIT;
         }
         // Dependency edges must go through `add_dependency`/`add_dependency_with_rule`,
         // which enforce cycle detection and MAX_DEPENDENCY_DEPTH. A caller-supplied
@@ -2584,17 +1410,25 @@ impl SoroTaskContract {
     /// Sets the maximum allowable single-update oracle price volatility threshold in basis points (bps).
     pub fn set_max_volatility_bps(env: Env, admin: Address, max_bps: u32) {
         admin.require_auth();
-        env.storage().instance().set(&DataKey::MaxVolatilityBps, &max_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxVolatilityBps, &max_bps);
     }
 
     /// Returns the maximum volatility threshold in bps (default: 500 = 5%).
     pub fn get_max_volatility_bps(env: &Env) -> u32 {
-        env.storage().instance().get(&DataKey::MaxVolatilityBps).unwrap_or(500)
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxVolatilityBps)
+            .unwrap_or(500)
     }
 
     /// Checks if the volatility circuit breaker is currently tripped.
     pub fn is_volatility_circuit_tripped(env: &Env) -> bool {
-        env.storage().instance().get(&DataKey::VolatilityCircuitBreakerTripped).unwrap_or(false)
+        env.storage()
+            .instance()
+            .get(&DataKey::VolatilityCircuitBreakerTripped)
+            .unwrap_or(false)
     }
 
     /// Updates oracle price, checking single-update price delta against max_volatility_bps.
@@ -2607,7 +1441,11 @@ impl SoroTaskContract {
         }
 
         let max_volatility = Self::get_max_volatility_bps(&env);
-        if let Some(last_price) = env.storage().instance().get::<DataKey, i128>(&DataKey::LastOraclePrice) {
+        if let Some(last_price) = env
+            .storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::LastOraclePrice)
+        {
             if last_price > 0 {
                 let diff = if new_price > last_price {
                     new_price - last_price
@@ -2616,9 +1454,13 @@ impl SoroTaskContract {
                 };
                 let volatility_bps = ((diff as u128 * 10_000) / last_price as u128) as u32;
                 if volatility_bps > max_volatility {
-                    env.storage().instance().set(&DataKey::VolatilityCircuitBreakerTripped, &true);
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VolatilityCircuitBreakerTripped, &true);
                     let current_time = env.ledger().timestamp();
-                    env.storage().instance().set(&DataKey::VolatilityUnpauseTimelock, &(current_time + 3_600));
+                    env.storage()
+                        .instance()
+                        .set(&DataKey::VolatilityUnpauseTimelock, &(current_time + 3_600));
                     crate::events::EventLogger::log_oracle_volatility_breach(
                         &env,
                         last_price,
@@ -2632,7 +1474,9 @@ impl SoroTaskContract {
             }
         }
 
-        env.storage().instance().set(&DataKey::LastOraclePrice, &new_price);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastOraclePrice, &new_price);
         exit_security_guard(&env);
         Ok(false)
     }
@@ -2640,12 +1484,18 @@ impl SoroTaskContract {
     /// Unpauses the volatility circuit breaker after timelock expiration.
     pub fn unpause_volatility_breaker(env: Env, admin: Address) -> Result<(), Error> {
         admin.require_auth();
-        if let Some(timelock) = env.storage().instance().get::<DataKey, u64>(&DataKey::VolatilityUnpauseTimelock) {
+        if let Some(timelock) = env
+            .storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::VolatilityUnpauseTimelock)
+        {
             if env.ledger().timestamp() < timelock {
                 return Err(Error::VolatilityTimelockActive);
             }
         }
-        env.storage().instance().set(&DataKey::VolatilityCircuitBreakerTripped, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::VolatilityCircuitBreakerTripped, &false);
         crate::events::EventLogger::log_volatility_circuit_breaker_unpaused(&env, admin);
         Ok(())
     }
@@ -3007,10 +1857,8 @@ impl SoroTaskContract {
                 .persistent()
                 .get::<DataKey, OracleDataResponse>(&DataKey::OracleResponses(i))
             {
-                let request: Option<OracleDataRequest> = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::OracleRequests(i));
+                let request: Option<OracleDataRequest> =
+                    env.storage().persistent().get(&DataKey::OracleRequests(i));
 
                 if let Some(req) = request {
                     if req.task_id == task_id && req.status == OracleRequestStatus::Fulfilled {
@@ -3033,12 +1881,7 @@ impl SoroTaskContract {
     // ============================================================================
 
     /// Sets or updates an oracle price feed entry for a given provider.
-    pub fn set_oracle_feed(
-        env: Env,
-        provider: OracleProvider,
-        price: i128,
-        decimals: u32,
-    ) {
+    pub fn set_oracle_feed(env: Env, provider: OracleProvider, price: i128, decimals: u32) {
         enter_security_guard(&env);
 
         let config: OracleConfig = env
@@ -3084,10 +1927,7 @@ impl SoroTaskContract {
     /// Returns the median price and the number of active feeds.
     /// Panics with `InsufficientOracleFeeds` if fewer than 1 feed is available.
     fn compute_median_price(env: &Env) -> (i128, u32) {
-        let providers = [
-            OracleProvider::Chainlink,
-            OracleProvider::Band,
-        ];
+        let providers = [OracleProvider::Chainlink, OracleProvider::Band];
 
         let mut prices: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
         let mut active_count: u32 = 0;
@@ -3142,10 +1982,7 @@ impl SoroTaskContract {
 
     /// Checks deviation between oracle feeds and halts if any pair exceeds `MAX_ORACLE_DEVIATION_BPS`.
     fn check_oracle_deviation(env: &Env) {
-        let providers = [
-            OracleProvider::Chainlink,
-            OracleProvider::Band,
-        ];
+        let providers = [OracleProvider::Chainlink, OracleProvider::Band];
 
         let mut prices: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(env);
 
@@ -3284,7 +2121,9 @@ impl SoroTaskContract {
             .instance()
             .get(&DataKey::VrfExpirationSeconds)
             .unwrap_or(DEFAULT_VRF_EXPIRATION_SECONDS);
-        let expiration_time = request_time.saturating_add(delay).saturating_add(expiration);
+        let expiration_time = request_time
+            .saturating_add(delay)
+            .saturating_add(expiration);
         if delay > 0 && now < expiration_time {
             panic_with_error!(&env, Error::ChallengeWindowActive);
         }
@@ -4004,7 +2843,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::ValidateAuth, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::ValidateAuth,
+            StepResult::Passed,
+            0,
         );
 
         // ── 2. Load task (meta + payload via normalized storage) ───────────
@@ -4017,10 +2861,20 @@ impl SoroTaskContract {
                     detail: Error::TaskNotFound as u32,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::LoadTask, StepResult::Failed,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::LoadTask,
+                    StepResult::Failed,
                     Error::TaskNotFound as u32,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::TaskNotFound);
             }
         };
@@ -4030,7 +2884,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::LoadTask, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::LoadTask,
+            StepResult::Passed,
+            0,
         );
 
         // ── 3. Check invalidation hooks (Issue #832) ────────────────────
@@ -4039,9 +2898,18 @@ impl SoroTaskContract {
             save_task(env, task_id, &config);
             remove_active_task_id(env, task_id);
             events::EventLogger::log_task_invalidated(
-                env, task_id, config.target.clone(), hook.callback_fn.clone(),
+                env,
+                task_id,
+                config.target.clone(),
+                hook.callback_fn.clone(),
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::TaskPaused);
         }
 
@@ -4055,13 +2923,28 @@ impl SoroTaskContract {
             Ok(_) => {}
             Err(Error::BlockExecutionLimitReached) => {
                 events::EventLogger::log_rate_limit_exceeded(
-                    env, task_id, get_block_execution_count(env), max_per_block,
+                    env,
+                    task_id,
+                    get_block_execution_count(env),
+                    max_per_block,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Skipped);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Skipped,
+                );
                 return;
             }
             Err(_) => {
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::BlockExecutionLimitReached);
             }
         }
@@ -4074,10 +2957,20 @@ impl SoroTaskContract {
                 detail: Error::TaskPaused as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckActive, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckActive,
+                StepResult::Failed,
                 Error::TaskPaused as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::TaskPaused);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4086,7 +2979,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckActive, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckActive,
+            StepResult::Passed,
+            0,
         );
 
         // ── 4. Check whitelist ────────────────────────────────────────────
@@ -4097,10 +2995,20 @@ impl SoroTaskContract {
                 detail: Error::Unauthorized as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckWhitelist, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckWhitelist,
+                StepResult::Failed,
                 Error::Unauthorized as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::Unauthorized);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4109,7 +3017,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckWhitelist, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckWhitelist,
+            StepResult::Passed,
+            0,
         );
 
         Self::require_vrf_keeper_winner(env, task_id, keeper);
@@ -4122,7 +3035,13 @@ impl SoroTaskContract {
             .get(&DataKey::TaskRequiresBond(task_id))
             .unwrap_or(false);
         if task_requires_bond && !Self::is_keeper_bonded(env.clone(), keeper.clone()) {
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::KeeperNotBonded);
         }
 
@@ -4134,9 +3053,20 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckInterval, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckInterval,
+                StepResult::Skipped,
+                0,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Skipped);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Skipped,
+            );
             return;
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4145,7 +3075,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckInterval, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckInterval,
+            StepResult::Passed,
+            0,
         );
 
         // ── 6. Check dependencies ─────────────────────────────────────────
@@ -4156,10 +3091,20 @@ impl SoroTaskContract {
                 detail: Error::DependencyBlocked as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckDependencies, StepResult::Failed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckDependencies,
+                StepResult::Failed,
                 Error::DependencyBlocked as u32,
             );
-            Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+            Self::persist_execution_trace(
+                env,
+                task_id,
+                keeper,
+                trace_steps,
+                ExecutionOutcome::Failed,
+            );
             panic_with_error!(env, Error::DependencyBlocked);
         }
         trace_steps.push_back(events::ExecutionStepRecord {
@@ -4168,7 +3113,12 @@ impl SoroTaskContract {
             detail: 0,
         });
         events::EventLogger::log_execution_step(
-            env, task_id, keeper, ExecutionStep::CheckDependencies, StepResult::Passed, 0,
+            env,
+            task_id,
+            keeper,
+            ExecutionStep::CheckDependencies,
+            StepResult::Passed,
+            0,
         );
 
         // ── 7. Resolver gate ──────────────────────────────────────────────
@@ -4194,7 +3144,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::EvaluateResolver, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::EvaluateResolver,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4203,7 +3158,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::EvaluateResolver, StepResult::Failed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::EvaluateResolver,
+                StepResult::Failed,
+                0,
             );
         }
 
@@ -4244,7 +3204,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckVrfCondition, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckVrfCondition,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4253,14 +3218,25 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckVrfCondition, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckVrfCondition,
+                StepResult::Skipped,
+                0,
             );
         }
 
         // ── 8b. Oracle freshness & deviation check (Issues #1040, #1041) ──
         {
-            let has_oracle_feeds = env.storage().persistent().has(&DataKey::OracleFeed(OracleProvider::Chainlink))
-                || env.storage().persistent().has(&DataKey::OracleFeed(OracleProvider::Band));
+            let has_oracle_feeds = env
+                .storage()
+                .persistent()
+                .has(&DataKey::OracleFeed(OracleProvider::Chainlink))
+                || env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::OracleFeed(OracleProvider::Band));
 
             if has_oracle_feeds {
                 // Check freshness of all feeds
@@ -4287,10 +3263,20 @@ impl SoroTaskContract {
                         detail: Error::OracleStale as u32,
                     });
                     events::EventLogger::log_execution_step(
-                        env, task_id, keeper, events::ExecutionStep::CheckOracleFreshness,
-                        StepResult::Failed, Error::OracleStale as u32,
+                        env,
+                        task_id,
+                        keeper,
+                        events::ExecutionStep::CheckOracleFreshness,
+                        StepResult::Failed,
+                        Error::OracleStale as u32,
                     );
-                    Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                    Self::persist_execution_trace(
+                        env,
+                        task_id,
+                        keeper,
+                        trace_steps,
+                        ExecutionOutcome::Failed,
+                    );
                     panic_with_error!(env, Error::OracleStale);
                 }
 
@@ -4303,8 +3289,12 @@ impl SoroTaskContract {
                     detail: 0,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, events::ExecutionStep::CheckOracleFreshness,
-                    StepResult::Passed, 0,
+                    env,
+                    task_id,
+                    keeper,
+                    events::ExecutionStep::CheckOracleFreshness,
+                    StepResult::Passed,
+                    0,
                 );
             }
         }
@@ -4318,7 +3308,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckZkCondition, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckZkCondition,
+                StepResult::Passed,
+                0,
             );
         } else {
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4327,7 +3322,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckZkCondition, StepResult::Skipped, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckZkCondition,
+                StepResult::Skipped,
+                0,
             );
         }
 
@@ -4340,7 +3340,12 @@ impl SoroTaskContract {
                 detail: fee as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CalculateFee, StepResult::Passed, fee as u32,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CalculateFee,
+                StepResult::Passed,
+                fee as u32,
             );
 
             // ── 11. Balance check ────────────────────────────────────────
@@ -4351,10 +3356,20 @@ impl SoroTaskContract {
                     detail: Error::InsufficientBalance as u32,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::CheckBalance, StepResult::Failed,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::CheckBalance,
+                    StepResult::Failed,
                     Error::InsufficientBalance as u32,
                 );
-                Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Failed,
+                );
                 panic_with_error!(env, Error::InsufficientBalance);
             }
             trace_steps.push_back(events::ExecutionStepRecord {
@@ -4363,7 +3378,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CheckBalance, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CheckBalance,
+                StepResult::Passed,
+                0,
             );
 
             // ── 12. Yield strategy execution ─────────────────────────────
@@ -4377,7 +3397,12 @@ impl SoroTaskContract {
                             detail: 0,
                         });
                         events::EventLogger::log_execution_step(
-                            env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Passed, 0,
+                            env,
+                            task_id,
+                            keeper,
+                            ExecutionStep::ExecuteYield,
+                            StepResult::Passed,
+                            0,
                         );
                         true
                     }
@@ -4388,10 +3413,20 @@ impl SoroTaskContract {
                             detail: Error::YieldHarvestFailed as u32,
                         });
                         events::EventLogger::log_execution_step(
-                            env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Failed,
+                            env,
+                            task_id,
+                            keeper,
+                            ExecutionStep::ExecuteYield,
+                            StepResult::Failed,
                             Error::YieldHarvestFailed as u32,
                         );
-                        Self::persist_execution_trace(env, task_id, keeper, trace_steps, ExecutionOutcome::Failed);
+                        Self::persist_execution_trace(
+                            env,
+                            task_id,
+                            keeper,
+                            trace_steps,
+                            ExecutionOutcome::Failed,
+                        );
                         panic_with_error!(env, Error::YieldHarvestFailed);
                     }
                 }
@@ -4402,7 +3437,12 @@ impl SoroTaskContract {
                     detail: 0,
                 });
                 events::EventLogger::log_execution_step(
-                    env, task_id, keeper, ExecutionStep::ExecuteYield, StepResult::Skipped, 0,
+                    env,
+                    task_id,
+                    keeper,
+                    ExecutionStep::ExecuteYield,
+                    StepResult::Skipped,
+                    0,
                 );
                 false
             };
@@ -4429,7 +3469,11 @@ impl SoroTaskContract {
                 detail: if executed_yield_strategy { 1 } else { 0 },
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::CallTarget, StepResult::Passed,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::CallTarget,
+                StepResult::Passed,
                 if executed_yield_strategy { 1 } else { 0 },
             );
 
@@ -4440,8 +3484,8 @@ impl SoroTaskContract {
                 .get(&DataKey::ProtocolFeeBps)
                 .unwrap_or(0);
 
-            let (protocol_fee, keeper_fee) = math::split_execution_fee(fee, protocol_fee_bps)
-                .unwrap_or((0, fee));
+            let (protocol_fee, keeper_fee) =
+                math::split_execution_fee(fee, protocol_fee_bps).unwrap_or((0, fee));
 
             config.gas_balance -= fee;
             sub_total_task_escrows(env, fee);
@@ -4478,11 +3522,7 @@ impl SoroTaskContract {
                         &token_client,
                     );
                     if !routed {
-                        token_client.transfer(
-                            &env.current_contract_address(),
-                            keeper,
-                            &keeper_fee,
-                        );
+                        token_client.transfer(&env.current_contract_address(), keeper, &keeper_fee);
                     }
                 }
                 assert_balance_invariant(env);
@@ -4493,7 +3533,12 @@ impl SoroTaskContract {
                 detail: fee as u32,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::PayKeeper, StepResult::Passed, fee as u32,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::PayKeeper,
+                StepResult::Passed,
+                fee as u32,
             );
 
             // ── 15. Update state ─────────────────────────────────────────
@@ -4518,7 +3563,12 @@ impl SoroTaskContract {
                 detail: 0,
             });
             events::EventLogger::log_execution_step(
-                env, task_id, keeper, ExecutionStep::UpdateState, StepResult::Passed, 0,
+                env,
+                task_id,
+                keeper,
+                ExecutionStep::UpdateState,
+                StepResult::Passed,
+                0,
             );
 
             // Emit keeper paid event
@@ -4555,7 +3605,9 @@ impl SoroTaskContract {
             steps,
             final_outcome,
         };
-        env.storage().persistent().set(&DataKey::ExecutionTrace(task_id), &trace);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ExecutionTrace(task_id), &trace);
     }
 
     pub fn execute(env: Env, keeper: Address, task_id: u64) {
@@ -4588,7 +3640,11 @@ impl SoroTaskContract {
             panic_with_error!(&env, Error::TaskNotFound);
         }
         extend_persistent_ttl(&env, &key);
-        if env.storage().persistent().has(&DataKey::TaskStatus(task_id)) {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TaskStatus(task_id))
+        {
             extend_persistent_ttl(&env, &DataKey::TaskStatus(task_id));
         }
     }
@@ -4634,11 +3690,7 @@ impl SoroTaskContract {
 
         if new_tier > old_tier {
             events::EventLogger::log_fee_discount_tier_updated(
-                env,
-                user,
-                old_tier,
-                new_tier,
-                new_count,
+                env, user, old_tier, new_tier, new_count,
             );
         }
     }
@@ -4668,7 +3720,8 @@ impl SoroTaskContract {
         }
 
         // Perform callback invocation with capital loan
-        let _callback_res = env.invoke_contract::<Val>(&callback_target, &callback_fn, callback_args);
+        let _callback_res =
+            env.invoke_contract::<Val>(&callback_target, &callback_fn, callback_args);
 
         // Verify loan repayment + fee condition
         let fee_bps: i128 = 30; // 0.3% flash loan fee
@@ -4714,7 +3767,8 @@ impl SoroTaskContract {
         let elapsed = now.saturating_sub(config.last_run);
         // Annual inflation adjustment: base * (1 + (elapsed * cpi_rate_bps) / (31_536_000 * 10_000))
         let base_bounty = FIXED_EXECUTION_FEE;
-        let inflation_delta = (base_bounty * elapsed as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
+        let inflation_delta =
+            (base_bounty * elapsed as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
         base_bounty + inflation_delta
     }
 
@@ -4727,18 +3781,27 @@ impl SoroTaskContract {
             None => panic_with_error!(&env, Error::TaskNotFound),
         };
 
-        let interval = if config.interval == 0 { 3600 } else { config.interval as u64 };
+        let interval = if config.interval == 0 {
+            3600
+        } else {
+            config.interval as u64
+        };
         let six_months_seconds: u64 = 15_768_000; // 182.5 days
         let expected_runs = six_months_seconds / interval;
         let base_bounty = FIXED_EXECUTION_FEE;
-        let inflation_delta = (base_bounty * six_months_seconds as i128 * cpi_rate_bps as i128) / (31_536_000 * 10_000);
+        let inflation_delta = (base_bounty * six_months_seconds as i128 * cpi_rate_bps as i128)
+            / (31_536_000 * 10_000);
         let adjusted_fee = base_bounty + inflation_delta;
         let required_escrow = expected_runs as i128 * adjusted_fee;
 
         let is_healthy = config.gas_balance >= required_escrow;
         if !is_healthy {
             env.events().publish(
-                (Symbol::new(&env, "BountyEscrowLow"), Symbol::new(&env, "v1"), task_id),
+                (
+                    Symbol::new(&env, "BountyEscrowLow"),
+                    Symbol::new(&env, "v1"),
+                    task_id,
+                ),
                 (config.gas_balance, required_escrow),
             );
         }
@@ -4757,7 +3820,9 @@ impl SoroTaskContract {
         // NOTE: We intentionally do not require init to set fee recipient to keep backward compatibility.
         // protocol_fee_bps defaults to 0.
         if !env.storage().instance().has(&DataKey::ProtocolFeeBps) {
-            env.storage().instance().set(&DataKey::ProtocolFeeBps, &0u32);
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeeBps, &0u32);
         }
 
         // Emit initialized event
@@ -4789,7 +3854,11 @@ impl SoroTaskContract {
     /// Validates whether the global balance invariant holds:
     /// contract_balance >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees
     pub fn check_balance_invariant(env: Env) -> bool {
-        if let Some(token_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::Token) {
+        if let Some(token_address) = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Token)
+        {
             let token_client = soroban_sdk::token::Client::new(&env, &token_address);
             let contract_balance = token_client.balance(&env.current_contract_address());
             let total_task_escrows = get_total_task_escrows(&env);
@@ -4812,7 +3881,9 @@ impl SoroTaskContract {
             .expect("Admin not initialized");
         admin.require_auth();
 
-        env.storage().instance().set(&DataKey::FeeRecipient, &recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &recipient);
 
         env.events().publish(
             (
@@ -5001,7 +4072,10 @@ impl SoroTaskContract {
             .set(&DataKey::EncryptedPayload(task_id), &payload);
 
         events::EventLogger::log_encrypted_params_registered(
-            &env, task_id, payload.encryption_scheme.clone(), payload.public_key.clone(),
+            &env,
+            task_id,
+            payload.encryption_scheme.clone(),
+            payload.public_key.clone(),
         );
 
         exit_security_guard(&env);
@@ -5074,7 +4148,11 @@ impl SoroTaskContract {
         update_keeper_total_delegated(&env, &keeper, amount);
 
         events::EventLogger::log_delegation_pool_event(
-            &env, delegator.clone(), keeper.clone(), amount, pool.commission_rate,
+            &env,
+            delegator.clone(),
+            keeper.clone(),
+            amount,
+            pool.commission_rate,
             Symbol::new(&env, "delegate"),
         );
 
@@ -5125,7 +4203,11 @@ impl SoroTaskContract {
         assert_balance_invariant(&env);
 
         events::EventLogger::log_delegation_pool_event(
-            &env, delegator.clone(), keeper, amount, pool.commission_rate,
+            &env,
+            delegator.clone(),
+            keeper,
+            amount,
+            pool.commission_rate,
             Symbol::new(&env, "undelegate"),
         );
 
@@ -5224,7 +4306,11 @@ impl SoroTaskContract {
             .get(&DataKey::Token)
             .expect("Token not initialized");
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
-        token_client.transfer(&env.current_contract_address(), &keeper, &bond.bonded_amount);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &keeper,
+            &bond.bonded_amount,
+        );
 
         env.storage()
             .persistent()
@@ -5257,9 +4343,7 @@ impl SoroTaskContract {
 
     /// Returns the keeper's bond status.
     pub fn get_keeper_bond(env: Env, keeper: Address) -> Option<KeeperBond> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::KeeperBond(keeper))
+        env.storage().persistent().get(&DataKey::KeeperBond(keeper))
     }
 
     /// Slashes a keeper's stake and redistributes according to Issue #1043:
@@ -5267,7 +4351,13 @@ impl SoroTaskContract {
     /// - 50% awarded to the whistleblower (caller submitting valid fraud proof).
     /// - Slashed keeper is locked from participating until stake is replenished.
     /// Only callable by an authorized slasher (e.g., admin or fraud proof oracle).
-    pub fn slash_keeper(env: Env, admin: Address, keeper: Address, slash_amount: i128, whistleblower: Address) {
+    pub fn slash_keeper(
+        env: Env,
+        admin: Address,
+        keeper: Address,
+        slash_amount: i128,
+        whistleblower: Address,
+    ) {
         enter_security_guard(&env);
         admin.require_auth();
 
@@ -5421,7 +4511,6 @@ impl SoroTaskContract {
             .get(&DataKey::TaskRequiresBond(task_id))
             .unwrap_or(false)
     }
-
 
     /// Initializes the contract for Soroban-native proxy upgrades.
     pub fn init_proxy(env: Env, admin: Address, token: Address, version: u32) {
@@ -5884,7 +4973,11 @@ impl SoroTaskContract {
             creator: existing.creator,
             gas_balance: existing.gas_balance,
             last_run: existing.last_run,
-            permissions: if new_config.permissions != 0 { new_config.permissions } else { existing.permissions },
+            permissions: if new_config.permissions != 0 {
+                new_config.permissions
+            } else {
+                existing.permissions
+            },
             ..new_config
         };
 
@@ -5945,7 +5038,9 @@ impl SoroTaskContract {
         };
         let key = DataKey::KeeperPayoutPreference(keeper);
         env.storage().persistent().set(&key, &pref);
-        env.storage().persistent().extend_ttl(&key, 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 100_000, 100_000);
     }
 
     /// Removes the calling keeper's payout routing preference, reverting
@@ -6000,8 +5095,8 @@ impl SoroTaskContract {
             _ => return false,
         };
 
-        let quote_args: Vec<Val> = (gas_token.clone(), pref.payout_token.clone(), amount)
-            .into_val(env);
+        let quote_args: Vec<Val> =
+            (gas_token.clone(), pref.payout_token.clone(), amount).into_val(env);
         let expected_out: i128 = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
             &pref.router,
             &Symbol::new(env, "get_amount_out"),
@@ -6071,7 +5166,12 @@ impl SoroTaskContract {
                 // back its own state changes), but revoke the approval
                 // defensively in case the router is still live for the rest
                 // of this ledger.
-                token_client.approve(&env.current_contract_address(), &pref.router, &0, &expiration_ledger);
+                token_client.approve(
+                    &env.current_contract_address(),
+                    &pref.router,
+                    &0,
+                    &expiration_ledger,
+                );
                 false
             }
         }
@@ -6130,7 +5230,9 @@ impl SoroTaskContract {
             resolved: false,
         };
         env.storage().persistent().set(&claim_key, &claim);
-        env.storage().persistent().extend_ttl(&claim_key, 100_000, 100_000);
+        env.storage()
+            .persistent()
+            .extend_ttl(&claim_key, 100_000, 100_000);
 
         env.events().publish(
             (
@@ -6160,7 +5262,9 @@ impl SoroTaskContract {
         if claim.resolved {
             panic_with_error!(&env, Error::NoOptimisticClaim);
         }
-        if env.ledger().sequence() >= claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS {
+        if env.ledger().sequence()
+            >= claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS
+        {
             panic_with_error!(&env, Error::ChallengeWindowClosed);
         }
 
@@ -6237,7 +5341,8 @@ impl SoroTaskContract {
         if claim.resolved {
             panic_with_error!(&env, Error::NoOptimisticClaim);
         }
-        if env.ledger().sequence() < claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS {
+        if env.ledger().sequence() < claim.submitted_at_ledger + OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS
+        {
             panic_with_error!(&env, Error::ChallengeWindowActive);
         }
 
@@ -6283,7 +5388,9 @@ impl SoroTaskContract {
     /// the last execution attempt, including which conditions passed
     /// or failed and the exact error codes.
     pub fn get_execution_trace(env: Env, task_id: u64) -> Option<ExecutionTrace> {
-        env.storage().persistent().get(&DataKey::ExecutionTrace(task_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::ExecutionTrace(task_id))
     }
 
     pub fn get_dependency_rules(env: Env, task_id: u64) -> Vec<DependencyRule> {
@@ -7768,13 +6875,7 @@ impl SoroTaskContract {
     }
 
     /// Entrypoint to vote on governance proposals.
-    pub fn vote(
-        env: Env,
-        voter: Address,
-        proposal_id: u64,
-        vote_for: bool,
-        voting_power: i128,
-    ) {
+    pub fn vote(env: Env, voter: Address, proposal_id: u64, vote_for: bool, voting_power: i128) {
         Self::vote_on_proposal(env, voter, proposal_id, vote_for, voting_power);
     }
 
@@ -8245,7 +7346,8 @@ impl SoroTaskContract {
 
         if task.interval > 0 && time_elapsed > task.interval as u64 {
             let overdue = time_elapsed - task.interval as u64;
-            let bonus_bps = (((overdue as u128 * 10_000) / task.interval as u128).min(20_000)) as u32;
+            let bonus_bps =
+                (((overdue as u128 * 10_000) / task.interval as u128).min(20_000)) as u32;
             return base_fee + ((base_fee * bonus_bps as i128) / 10_000);
         }
 
@@ -8550,11 +7652,7 @@ impl SoroTaskContract {
         env.crypto()
             .ed25519_verify(&public_key, &payload, &signature);
 
-        let counter: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Counter)
-            .unwrap_or(0);
+        let counter: u64 = env.storage().instance().get(&DataKey::Counter).unwrap_or(0);
         let task_id = counter + 1;
 
         if task_config.interval == 0 {
@@ -8642,10 +7740,7 @@ impl SoroTaskContract {
     }
 
     /// Configures target reserve and returns updated solvency report.
-    pub fn auto_balance_insurance_vault(
-        env: Env,
-        target_reserve: i128,
-    ) -> InsuranceSolvencyReport {
+    pub fn auto_balance_insurance_vault(env: Env, target_reserve: i128) -> InsuranceSolvencyReport {
         enter_security_guard(&env);
         env.storage()
             .instance()
@@ -8948,6 +8043,53 @@ impl SoroTaskContract {
         Self::_is_cross_chain_nonce_used(&env, chain_id, nonce)
     }
 
+    // =========================================================================
+    // Groth16 Zero-Knowledge Proof Gate (Issue #1195)
+    // =========================================================================
+
+    /// Store (or update) the Groth16 verification-key digest for the ZK gate.
+    ///
+    /// `vk_digest` is `SHA-256(α_bytes || β_bytes || γ_bytes || δ_bytes || IC_bytes)`.
+    /// Only the contract admin may call this.
+    ///
+    /// # Arguments
+    /// * `env`       – Soroban environment.
+    /// * `admin`     – Admin address (must be the stored admin).
+    /// * `vk_digest` – 32-byte SHA-256 digest of the full verification key.
+    pub fn set_zk_verification_key(env: Env, admin: Address, vk_digest: BytesN<32>) {
+        enter_security_guard(&env);
+        admin.require_auth();
+        crate::zk::store_verification_key(&env, vk_digest);
+        exit_security_guard(&env);
+    }
+
+    /// Return the stored ZK verification-key digest, if any.
+    pub fn get_zk_verification_key(env: Env) -> Option<BytesN<32>> {
+        crate::zk::get_verification_key(&env)
+    }
+
+    /// Check whether a proof nullifier has already been spent.
+    ///
+    /// Returns `true` if the nullifier is in the spent-set (replay attempted).
+    pub fn is_zk_nullifier_spent(env: Env, nullifier: BytesN<32>) -> bool {
+        crate::zk::is_nullifier_spent(&env, &nullifier)
+    }
+
+    /// Execute a task gated behind a Groth16 ZK proof (Issue #1195).
+    ///
+    /// Valid proofs approve task execution; forged proofs or replayed nullifiers
+    /// are rejected with [`Error::InvalidZkProof`].
+    ///
+    /// # Arguments
+    /// * `env`     – Soroban environment.
+    /// * `task_id` – ID of the task to trigger.
+    /// * `proof`   – [`zk::Groth16Proof`] authorising execution.
+    pub fn execute_zk(env: Env, task_id: u64, proof: crate::zk::Groth16Proof) {
+        enter_security_guard(&env);
+        crate::zk::execute_zk(&env, task_id, proof);
+        exit_security_guard(&env);
+    }
+
     // ─── Commit-Reveal Anti-Frontrunning Protocol (SC-HARD-07) ──────────────
 
     /// Phase 1 – Commit. Keeper posts a hash commitment before executing.
@@ -9085,6 +8227,8 @@ impl SoroTaskContract {
         );
     }
 }
+    }
+}
 
 // ============================================================================
 // Tests
@@ -9092,6 +8236,9 @@ impl SoroTaskContract {
 
 #[cfg(test)]
 mod test_gas;
+
+#[cfg(test)]
+mod test_zk;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -10220,7 +9367,10 @@ pub(crate) mod tests {
             .steps
             .iter()
             .find(|s| s.step == events::ExecutionStep::CallTarget);
-        assert!(target_step.is_none(), "target should not be called when resolver denied");
+        assert!(
+            target_step.is_none(),
+            "target should not be called when resolver denied"
+        );
     }
 
     /// When a task is paused, the execution panics. In Soroban, panics revert
@@ -10246,7 +9396,10 @@ pub(crate) mod tests {
 
         // The trace is NOT persisted because the panic reverts storage
         let trace = client.get_execution_trace(&task_id);
-        assert!(trace.is_none(), "trace should NOT exist - panic reverted storage");
+        assert!(
+            trace.is_none(),
+            "trace should NOT exist - panic reverted storage"
+        );
     }
 
     /// When the interval hasn't elapsed, the trace shows Skipped and
@@ -10649,7 +9802,12 @@ pub(crate) mod tests {
         };
 
         let result = client.try_register(&config);
-        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(Error::InvalidInterval as u32))));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::InvalidInterval as u32
+            )))
+        );
     }
 
     #[test]
@@ -10853,7 +10011,12 @@ pub(crate) mod tests {
 
         set_timestamp(&env, 12_345);
         let result = client.try_execute(&unauthorized_keeper, &task_id);
-        assert_eq!(result, Err(Ok(soroban_sdk::Error::from_contract_error(Error::Unauthorized as u32))));
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(
+                Error::Unauthorized as u32
+            )))
+        );
     }
 
     #[test]
@@ -10948,8 +10111,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -11013,8 +10175,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -11064,8 +10225,7 @@ pub(crate) mod tests {
         let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
         let gas_token = token_id.address();
         let gas_token_client = soroban_sdk::token::Client::new(&env, &gas_token);
-        let gas_token_admin_client =
-            soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
+        let gas_token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &gas_token);
 
         let payout_admin = Address::generate(&env);
         let payout_token_id = env.register_stellar_asset_contract_v2(payout_admin.clone());
@@ -11174,7 +10334,6 @@ pub(crate) mod tests {
         assert_eq!(token_client.balance(&fee_recipient), 5);
         assert_eq!(token_client.balance(&keeper), 95);
     }
-
 
     /// Test that execution fails if gas_balance is insufficient for the fee.
     #[test]
@@ -12031,7 +11190,10 @@ pub(crate) mod tests {
         let status = client.get_task_status(&task_id);
         assert_eq!(status.outcome, ExecutionOutcome::Success);
         assert_eq!(client.get_task(&task_id).unwrap().last_run, 3_600);
-        assert!(token_client.balance(&keeper) > 0, "keeper should have been paid");
+        assert!(
+            token_client.balance(&keeper) > 0,
+            "keeper should have been paid"
+        );
     }
 
     #[test]
@@ -12412,14 +11574,7 @@ pub(crate) mod tests {
         let commitment = BytesN::from_array(&env, &[1u8; 32]);
         let proof = Bytes::from_slice(&env, &[10, 20, 30, 40]);
 
-        client.submit_zk_range_proof(
-            &101u64,
-            &100i128,
-            &500i128,
-            &commitment,
-            &proof,
-            &verifier,
-        );
+        client.submit_zk_range_proof(&101u64, &100i128, &500i128, &commitment, &proof, &verifier);
 
         assert!(!client.is_zk_range_proof_satisfied(&101u64));
 
@@ -12533,7 +11688,10 @@ pub(crate) mod tests {
 
         // Test vote delegation
         client.delegate_vote(&delegator, &delegatee);
-        assert_eq!(client.get_vote_delegate(&delegator), Some(delegatee.clone()));
+        assert_eq!(
+            client.get_vote_delegate(&delegator),
+            Some(delegatee.clone())
+        );
 
         // Test propose parameter change
         let title = Bytes::from_slice(&env, b"Param Change Proposal");
@@ -12573,7 +11731,10 @@ pub(crate) mod tests {
         cfg.permissions = PERM_CAN_PAUSE;
 
         let task_id = client.register(&cfg);
-        assert_eq!(client.get_task(&task_id).unwrap().permissions, PERM_CAN_PAUSE);
+        assert_eq!(
+            client.get_task(&task_id).unwrap().permissions,
+            PERM_CAN_PAUSE
+        );
 
         // Pause should succeed since PERM_CAN_PAUSE (1) is set
         client.pause_task(&task_id);
@@ -12793,8 +11954,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_challenge_optimistic_result_slashes_dishonest_keeper() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         let token_address = client.get_token();
         let token_client = soroban_sdk::token::Client::new(&env, &token_address);
 
@@ -12816,8 +11976,7 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "Error(Contract, #50)")]
     fn test_challenge_optimistic_result_reverts_when_claim_is_honest() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysTrue);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysTrue);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         let challenger = Address::generate(&env);
         client.challenge_optimistic_result(&challenger, &task_id);
@@ -12826,8 +11985,7 @@ pub(crate) mod tests {
     #[test]
     #[should_panic(expected = "Error(Contract, #48)")]
     fn test_challenge_optimistic_result_after_window_reverts() {
-        let (env, client, task_id, keeper) =
-            setup_optimistic_task(OptimisticResolver::AlwaysFalse);
+        let (env, client, task_id, keeper) = setup_optimistic_task(OptimisticResolver::AlwaysFalse);
         client.submit_optimistic_result(&keeper, &task_id, &true, &100);
         env.ledger()
             .with_mut(|l| l.sequence_number += OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS);
