@@ -9,7 +9,8 @@ pub mod packed_args;
 // `pub mod access; pub mod execution; pub mod oracle; pub mod storage;
 // pub mod types; pub mod vrf; pub mod yield;` — none of those files
 // (src/access.rs, src/execution.rs, etc.) exist in this crate, and
-// `pub mod events;` was declared twice. Both are hard compile errors
+// `pub mod dex_router;
+pub mod events;` was declared twice. Both are hard compile errors
 // ("file not found for module" / "the name `events` is defined multiple
 // times"), and nothing else in this file referenced any of the six
 // nonexistent modules by path — only the `pub use *` lines removed here
@@ -326,6 +327,7 @@ pub struct TaskConfig {
     pub yield_strategy: Option<u64>,
     /// Gas-optimized bitmask vector for role-based permissions
     pub permissions: u32,
+    pub target_payment_token: Option<Address>,
 }
 
 /// A single invocation within a [`TaskBundle`]: `target::function(args)`.
@@ -5867,7 +5869,7 @@ impl SoroTaskContract {
             panic_with_error!(&env, e);
         }
 
-        let updated = TaskConfig {
+        let updated = TaskConfig { target_payment_token: None,
             creator: existing.creator,
             gas_balance: existing.gas_balance,
             last_run: existing.last_run,
@@ -9143,8 +9145,8 @@ pub(crate) mod tests {
         (env, id)
     }
 
-    fn base_config(env: &Env, target: Address) -> TaskConfig {
-        TaskConfig {
+    fn base_config(env: &Env, target: Address) -> TaskConfig { target_payment_token: None,
+        TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: Address::generate(env),
             target,
@@ -9821,7 +9823,7 @@ pub(crate) mod tests {
         args.push_back(5_i64.into_val(&env));
         args.push_back(3_i64.into_val(&env));
 
-        let cfg = TaskConfig {
+        let cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: Address::generate(&env),
             target,
@@ -9854,7 +9856,7 @@ pub(crate) mod tests {
         let target = env.register(MockTarget, ());
         let resolver = env.register(resolver_true::MockResolverTrue, ());
 
-        let cfg = TaskConfig {
+        let cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             resolver: Some(resolver),
             ..base_config(&env, target)
@@ -9882,7 +9884,7 @@ pub(crate) mod tests {
         let target = env.register(MockTarget, ());
         let resolver = env.register(resolver_false::MockResolverFalse, ());
 
-        let cfg = TaskConfig {
+        let cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             resolver: Some(resolver),
             ..base_config(&env, target)
@@ -9989,7 +9991,7 @@ pub(crate) mod tests {
         let target = env.register(MockTarget, ());
         let resolver = env.register(resolver_false::MockResolverFalse, ());
 
-        let cfg = TaskConfig {
+        let cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             resolver: Some(resolver),
             ..base_config(&env, target)
@@ -10106,7 +10108,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: creator.clone(),
             target: target.clone(),
@@ -10150,7 +10152,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: creator.clone(),
             target: target.clone(),
@@ -10189,7 +10191,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let valid_config = TaskConfig {
+        let valid_config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10205,7 +10207,7 @@ pub(crate) mod tests {
             permissions: 15,
         };
 
-        let invalid_config = TaskConfig {
+        let invalid_config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10242,7 +10244,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10282,7 +10284,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10334,7 +10336,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10387,7 +10389,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -10430,7 +10432,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: creator.clone(),
             target: target.clone(),
@@ -10534,7 +10536,7 @@ pub(crate) mod tests {
         let dummy_id = env.register(DummyContract, ());
         let target = dummy_id.clone();
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             creator: creator.clone(),
             target: target.clone(),
@@ -11695,7 +11697,7 @@ pub(crate) mod tests {
         let target = env.register(MockTarget, ());
         let resolver = env.register(resolver_false::MockResolverFalse, ());
 
-        let dependency_cfg = TaskConfig {
+        let dependency_cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             resolver: Some(resolver),
             ..base_config(&env, target.clone())
@@ -11756,7 +11758,7 @@ pub(crate) mod tests {
         args.push_back(id.clone().into_val(&env));
         args.push_back(victim_id.into_val(&env));
 
-        let malicious_cfg = TaskConfig {
+        let malicious_cfg = TaskConfig { target_payment_token: None,
             yield_strategy: None,
             function: Symbol::new(&env, "reenter_pause"),
             args,
@@ -12237,7 +12239,7 @@ pub(crate) mod tests {
         let creator = Address::generate(&env);
         let target = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: creator.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
@@ -12279,7 +12281,7 @@ pub(crate) mod tests {
         let token_borrow = Address::generate(&env);
         let token_repay = Address::generate(&env);
 
-        let config = TaskConfig {
+        let config = TaskConfig { target_payment_token: None,
             creator: keeper.clone(),
             target: target.clone(),
             function: Symbol::new(&env, "hello"),
