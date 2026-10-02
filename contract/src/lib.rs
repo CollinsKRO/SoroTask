@@ -3,6 +3,7 @@
 pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
+pub mod insurance;
 pub mod events;
 pub use events::*;
 pub mod admin;
@@ -86,6 +87,8 @@ pub enum Error {
     InvalidVdfProof = 58,
     UpgradeNotProposed = 59,
     UpgradeTimelockActive = 60,
+    InsuranceReserveInsufficient = 61,
+    InsuranceClaimNotCertified = 62,
     // Oracle freshness / multi-oracle errors (Issues #1040, #1041)
     OracleStale = 411,
     OracleDeviationExceeded = 412,
@@ -729,6 +732,15 @@ pub struct YieldStrategyConfig {
 
 #[contracttype]
 #[derive(Clone, Debug)]
+pub struct YieldLiquidityConfig {
+    pub deposit_function: Symbol,
+    pub withdraw_function: Symbol,
+    pub deposit_args: Vec<Val>,
+    pub withdraw_args: Vec<Val>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
 pub struct StakingBalance {
     pub address: Address,
     pub amount: i128,
@@ -992,6 +1004,16 @@ pub struct InsuranceSolvencyReport {
     pub is_solvent: bool,
 }
 
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InsuranceFaultProof {
+    pub task_id: u64,
+    pub keeper: Address,
+    pub certified_by: Address,
+    pub failure_reason: Bytes,
+    pub certified_at: u64,
+}
+
 /// Supported cross-chain source networks for the CCIP Trigger Gateway.
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1083,8 +1105,14 @@ pub enum DataKey {
     OracleResponses(u64),
     InsurancePolicyCounter,
     InsurancePolicy(u64),
+    TaskInsurancePolicy(u64),
+    InsuranceFaultProof(u64),
+    InsuranceFundedBalance,
     YieldStrategyCounter,
     YieldStrategies(u64),
+    YieldLiquidity(u64),
+    YieldInvestedEscrow(u64),
+    TotalInvestedTaskEscrows,
     ReentrancyLock,
     ZkConditions(u64),
     ZkConditionCounter,
@@ -1457,6 +1485,145 @@ fn sub_total_task_escrows(env: &Env, amount: i128) {
     }
 }
 
+fn get_task_invested_escrow(env: &Env, task_id: u64) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::YieldInvestedEscrow(task_id))
+        .unwrap_or(0)
+}
+
+fn get_total_invested_task_escrows(env: &Env) -> i128 {
+    env.storage()
+        .instance()
+        .get(&DataKey::TotalInvestedTaskEscrows)
+        .unwrap_or(0)
+}
+
+fn set_task_invested_escrow(env: &Env, task_id: u64, amount: i128) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::YieldInvestedEscrow(task_id), &amount);
+}
+
+fn invest_task_gas(env: &Env, task_id: u64, config: &TaskConfig, amount: i128) {
+    let Some(strategy_id) = config.yield_strategy else {
+        return;
+    };
+    let Some(liquidity) = env
+        .storage()
+        .persistent()
+        .get::<DataKey, YieldLiquidityConfig>(&DataKey::YieldLiquidity(strategy_id))
+    else {
+        return;
+    };
+    if amount <= 0 {
+        return;
+    }
+
+    let token_address: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Token)
+        .expect("Not initialized");
+    let strategy: YieldStrategyConfig = env
+        .storage()
+        .persistent()
+        .get(&DataKey::YieldStrategies(strategy_id))
+        .expect("Yield strategy not found");
+    let token_client = soroban_sdk::token::Client::new(env, &token_address);
+    let expiration_ledger = env.ledger().sequence().saturating_add(1);
+    token_client.approve(
+        &env.current_contract_address(),
+        &strategy.protocol_address,
+        &amount,
+        &expiration_ledger,
+    );
+
+    let mut args = liquidity.deposit_args;
+    args.push_back(token_address.into_val(env));
+    args.push_back(task_id.into_val(env));
+    args.push_back(amount.into_val(env));
+    match env.try_invoke_contract::<Val, soroban_sdk::Error>(
+        &strategy.protocol_address,
+        &liquidity.deposit_function,
+        args,
+    ) {
+        Ok(Ok(_)) => {}
+        _ => panic_with_error!(env, Error::YieldHarvestFailed),
+    }
+    token_client.approve(
+        &env.current_contract_address(),
+        &strategy.protocol_address,
+        &0,
+        &expiration_ledger,
+    );
+
+    let invested = get_task_invested_escrow(env, task_id).saturating_add(amount);
+    set_task_invested_escrow(env, task_id, invested);
+    env.storage().instance().set(
+        &DataKey::TotalInvestedTaskEscrows,
+        &get_total_invested_task_escrows(env).saturating_add(amount),
+    );
+}
+
+fn ensure_task_liquid(env: &Env, task_id: u64, config: &TaskConfig, amount: i128) {
+    if amount <= 0 {
+        return;
+    }
+    let invested = get_task_invested_escrow(env, task_id);
+    let liquid = config.gas_balance.saturating_sub(invested);
+    let amount_to_withdraw = amount.saturating_sub(liquid);
+    if amount_to_withdraw <= 0 {
+        return;
+    }
+
+    let strategy_id = config
+        .yield_strategy
+        .unwrap_or_else(|| panic_with_error!(env, Error::InvalidYieldStrategy));
+    let liquidity: YieldLiquidityConfig = env
+        .storage()
+        .persistent()
+        .get(&DataKey::YieldLiquidity(strategy_id))
+        .unwrap_or_else(|| panic_with_error!(env, Error::InvalidYieldStrategy));
+    let strategy: YieldStrategyConfig = env
+        .storage()
+        .persistent()
+        .get(&DataKey::YieldStrategies(strategy_id))
+        .unwrap_or_else(|| panic_with_error!(env, Error::YieldStrategyNotInitialized));
+    let token_address: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Token)
+        .expect("Not initialized");
+    let token_client = soroban_sdk::token::Client::new(env, &token_address);
+    let contract_address = env.current_contract_address();
+    let balance_before = token_client.balance(&contract_address);
+
+    let mut args = liquidity.withdraw_args;
+    args.push_back(token_address.into_val(env));
+    args.push_back(task_id.into_val(env));
+    args.push_back(amount_to_withdraw.into_val(env));
+    let received = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+        &strategy.protocol_address,
+        &liquidity.withdraw_function,
+        args,
+    ) {
+        Ok(Ok(received)) if received >= amount_to_withdraw => received,
+        _ => panic_with_error!(env, Error::YieldHarvestFailed),
+    };
+    let balance_after = token_client.balance(&contract_address);
+    if balance_after.saturating_sub(balance_before) < amount_to_withdraw {
+        panic_with_error!(env, Error::YieldHarvestFailed);
+    }
+
+    let remaining = invested.saturating_sub(amount_to_withdraw);
+    set_task_invested_escrow(env, task_id, remaining);
+    env.storage().instance().set(
+        &DataKey::TotalInvestedTaskEscrows,
+        &get_total_invested_task_escrows(env).saturating_sub(amount_to_withdraw),
+    );
+}
+
 fn get_total_keeper_stakes(env: &Env) -> i128 {
     env.storage()
         .instance()
@@ -1506,16 +1673,21 @@ fn assert_balance_invariant(env: &Env) {
         let token_client = soroban_sdk::token::Client::new(env, &token_address);
         let contract_balance = token_client.balance(&env.current_contract_address());
         let total_task_escrows = get_total_task_escrows(env);
+        let total_invested_task_escrows = get_total_invested_task_escrows(env);
         let total_keeper_stakes = get_total_keeper_stakes(env);
         let total_unclaimed_fees = get_total_unclaimed_fees(env);
+        let insurance_reserve = insurance::funded_balance(env);
         assert!(
-            contract_balance >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees,
-            "Total balance invariant violated: contract balance {} is less than required sum {} (escrows: {}, stakes: {}, unclaimed: {})",
-            contract_balance,
-            total_task_escrows + total_keeper_stakes + total_unclaimed_fees,
+            contract_balance.saturating_add(total_invested_task_escrows)
+                >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees + insurance_reserve,
+            "Total balance invariant violated: liquid plus invested balance {} is less than required sum {} (escrows: {}, invested: {}, stakes: {}, unclaimed: {}, insurance: {})",
+            contract_balance.saturating_add(total_invested_task_escrows),
+            total_task_escrows + total_keeper_stakes + total_unclaimed_fees + insurance_reserve,
             total_task_escrows,
+            total_invested_task_escrows,
             total_keeper_stakes,
-            total_unclaimed_fees
+            total_unclaimed_fees,
+            insurance_reserve
         );
     }
 }
@@ -2372,6 +2544,18 @@ impl SoroTaskContract {
 
         exit_security_guard(&env);
         counter
+    }
+
+    /// Registers a task and attaches insurance atomically, charging its 1% premium.
+    pub fn register_insured(
+        env: Env,
+        config: TaskConfig,
+        coverage_amount: i128,
+    ) -> u64 {
+        let owner = config.creator.clone();
+        let task_id = Self::register(env.clone(), config);
+        Self::purchase_task_insurance(env, owner, task_id, coverage_amount);
+        task_id
     }
 
     /// Retrieves a task configuration by its ID.
@@ -4641,21 +4825,20 @@ impl SoroTaskContract {
             };
 
             // ── 13. Cross-contract call ─────────────────────────────────
-            if !executed_yield_strategy {
-                // Throttling skips this execution without charging task funds
-                // or slashing keeper stake.
-                if !rate_limiter::allow_invocation(env, &config.target) {
-                    Self::persist_execution_trace(
-                        env,
-                        task_id,
-                        keeper,
-                        trace_steps,
-                        ExecutionOutcome::Skipped,
-                    );
-                    return;
-                }
-                env.invoke_contract::<Val>(&config.target, &config.function, config.args.clone());
+            // Throttling skips this execution without charging task funds or
+            // slashing keeper stake. Yield harvesting is an add-on, not a
+            // replacement for the configured task invocation.
+            if !rate_limiter::allow_invocation(env, &config.target) {
+                Self::persist_execution_trace(
+                    env,
+                    task_id,
+                    keeper,
+                    trace_steps,
+                    ExecutionOutcome::Skipped,
+                );
+                return;
             }
+            env.invoke_contract::<Val>(&config.target, &config.function, config.args.clone());
             trace_steps.push_back(events::ExecutionStepRecord {
                 step: ExecutionStep::CallTarget,
                 result: StepResult::Passed,
@@ -4680,6 +4863,7 @@ impl SoroTaskContract {
             let (protocol_fee, keeper_fee) =
                 math::split_execution_fee(fee, protocol_fee_bps).unwrap_or((0, fee));
 
+            ensure_task_liquid(env, task_id, &config, fee);
             config.gas_balance -= fee;
             sub_total_task_escrows(env, fee);
 
@@ -5045,7 +5229,7 @@ impl SoroTaskContract {
     }
 
     /// Validates whether the global balance invariant holds:
-    /// contract_balance >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees
+    /// liquid plus invested assets cover all task, keeper, fee, and insurance liabilities.
     pub fn check_balance_invariant(env: Env) -> bool {
         if let Some(token_address) = env
             .storage()
@@ -5055,9 +5239,15 @@ impl SoroTaskContract {
             let token_client = soroban_sdk::token::Client::new(&env, &token_address);
             let contract_balance = token_client.balance(&env.current_contract_address());
             let total_task_escrows = get_total_task_escrows(&env);
+            let invested_task_escrows = get_total_invested_task_escrows(&env);
             let total_keeper_stakes = get_total_keeper_stakes(&env);
             let total_unclaimed_fees = get_total_unclaimed_fees(&env);
-            contract_balance >= total_task_escrows + total_keeper_stakes + total_unclaimed_fees
+            let insurance_reserve = insurance::funded_balance(&env);
+            contract_balance.saturating_add(invested_task_escrows)
+                >= total_task_escrows
+                    + total_keeper_stakes
+                    + total_unclaimed_fees
+                    + insurance_reserve
         } else {
             true
         }
@@ -5914,6 +6104,7 @@ impl SoroTaskContract {
         // Transfer tokens to contract
         let token_client = soroban_sdk::token::Client::new(env, &token_address);
         token_client.transfer(from, &env.current_contract_address(), &amount);
+        invest_task_gas(env, task_id, &config, amount);
 
         // Update balance
         config.gas_balance += amount;
@@ -5964,6 +6155,8 @@ impl SoroTaskContract {
             .get(&DataKey::Token)
             .expect("Not initialized");
 
+        ensure_task_liquid(&env, task_id, &config, amount);
+
         // Update balance
         config.gas_balance -= amount;
         save_task(&env, task_id, &config);
@@ -6000,6 +6193,7 @@ impl SoroTaskContract {
 
         // Refund: Automatically withdraw all remaining gas_balance to the creator
         if config.gas_balance > 0 {
+            ensure_task_liquid(&env, task_id, &config, config.gas_balance);
             sub_total_task_escrows(&env, config.gas_balance);
             if env.storage().instance().has(&DataKey::Token) {
                 let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -6032,6 +6226,9 @@ impl SoroTaskContract {
 
         // Cleanup: Remove the task from storage (legacy + split keys)
         storage::remove_task(&env, task_id);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::YieldInvestedEscrow(task_id));
         env.storage()
             .persistent()
             .remove(&DataKey::TaskStatus(task_id));
@@ -6086,6 +6283,7 @@ impl SoroTaskContract {
         }
 
         if config.gas_balance > 0 {
+            ensure_task_liquid(&env, task_id, &config, config.gas_balance);
             sub_total_task_escrows(&env, config.gas_balance);
             if env.storage().instance().has(&DataKey::Token) {
                 let token_address: Address = env.storage().instance().get(&DataKey::Token).unwrap();
@@ -6114,6 +6312,9 @@ impl SoroTaskContract {
             .remove(&DataKey::TaskFingerprint(fingerprint));
 
         env.storage().persistent().remove(&task_key);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::YieldInvestedEscrow(task_id));
         env.storage()
             .persistent()
             .remove(&DataKey::TaskStatus(task_id));
@@ -6160,6 +6361,12 @@ impl SoroTaskContract {
 
         if let Err(e) = Self::validate_args(&env, &new_config.args) {
             panic_with_error!(&env, e);
+        }
+
+        if get_task_invested_escrow(&env, task_id) > 0
+            && new_config.yield_strategy != existing.yield_strategy
+        {
+            panic_with_error!(&env, Error::InvalidYieldStrategy);
         }
 
         let updated = TaskConfig {
@@ -7433,6 +7640,54 @@ impl SoroTaskContract {
         exit_security_guard(&env);
     }
 
+    /// Configures a strategy's pool adapter. The adapter calls receive the
+    /// configured args followed by `(token, task_id, amount)`; withdrawals
+    /// must return the amount transferred back to this contract.
+    pub fn configure_yield_liquidity(
+        env: Env,
+        strategy_id: u64,
+        deposit_function: Symbol,
+        withdraw_function: Symbol,
+        deposit_args: Vec<Val>,
+        withdraw_args: Vec<Val>,
+    ) {
+        enter_security_guard(&env);
+        let admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::AdminAddress)
+            .expect("Admin not initialized");
+        admin.require_auth();
+
+        let strategy: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldStrategies(strategy_id))
+            .expect("Yield strategy not found");
+        if !strategy.is_active {
+            panic_with_error!(&env, Error::InvalidYieldStrategy);
+        }
+
+        env.storage().persistent().set(
+            &DataKey::YieldLiquidity(strategy_id),
+            &YieldLiquidityConfig {
+                deposit_function: deposit_function.clone(),
+                withdraw_function: withdraw_function.clone(),
+                deposit_args,
+                withdraw_args,
+            },
+        );
+        env.events().publish(
+            (
+                Symbol::new(&env, "YieldLiquidityConfigured"),
+                Symbol::new(&env, "v1"),
+                strategy_id,
+            ),
+            (deposit_function, withdraw_function),
+        );
+        exit_security_guard(&env);
+    }
+
     /// Executes a yield harvesting strategy.
     /// Called by tasks configured to use yield harvesting.
     pub fn execute_yield_strategy(env: Env, strategy_id: u64, task_id: u64) -> Result<(), Error> {
@@ -7440,6 +7695,77 @@ impl SoroTaskContract {
         let result = Self::execute_yield_strategy_internal(&env, strategy_id, task_id);
         exit_security_guard(&env);
         result
+    }
+
+    /// Harvests and compounds yield for a task's configured strategy.
+    /// The protocol harvest function must return the harvested amount as `i128`;
+    /// harvest receives configured args followed by `(token, task_id)`, and
+    /// compound receives configured args followed by `(token, task_id, amount)`.
+    pub fn harvest_yield(env: Env, task_id: u64) -> Result<i128, Error> {
+        enter_security_guard(&env);
+        let result = Self::harvest_yield_internal(&env, task_id);
+        exit_security_guard(&env);
+        result
+    }
+
+    fn harvest_yield_internal(env: &Env, task_id: u64) -> Result<i128, Error> {
+        Self::check_feature_enabled(env, FEATURE_YIELD_STRATEGY);
+        let config = load_task(env, task_id).expect("Task not found");
+        let strategy_id = config
+            .yield_strategy
+            .ok_or(Error::YieldStrategyNotInitialized)?;
+        let strategy: YieldStrategyConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::YieldStrategies(strategy_id))
+            .expect("Yield strategy not found");
+        if !strategy.is_active {
+            return Err(Error::YieldStrategyNotInitialized);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Not initialized");
+        let mut harvest_args = strategy.harvest_args.clone();
+        harvest_args.push_back(token_address.clone().into_val(env));
+        harvest_args.push_back(task_id.into_val(env));
+        let harvested = match env.try_invoke_contract::<i128, soroban_sdk::Error>(
+            &strategy.protocol_address,
+            &strategy.harvest_function,
+            harvest_args,
+        ) {
+            Ok(Ok(amount)) if amount >= 0 => amount,
+            _ => return Err(Error::YieldHarvestFailed),
+        };
+
+        if harvested == 0 || harvested < strategy.min_yield_threshold {
+            return Ok(0);
+        }
+
+        let mut compound_args = strategy.compound_args.clone();
+        compound_args.push_back(token_address.into_val(env));
+        compound_args.push_back(task_id.into_val(env));
+        compound_args.push_back(harvested.into_val(env));
+        match env.try_invoke_contract::<Val, soroban_sdk::Error>(
+            &strategy.protocol_address,
+            &strategy.compound_function,
+            compound_args,
+        ) {
+            Ok(Ok(_)) => {}
+            _ => return Err(Error::YieldHarvestFailed),
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(env, "YieldCompounded"),
+                Symbol::new(env, "v1"),
+                task_id,
+            ),
+            (strategy_id, harvested),
+        );
+        Ok(harvested)
     }
 
     /// Guard-free core of [`Self::execute_yield_strategy`].
@@ -7465,6 +7791,19 @@ impl SoroTaskContract {
 
         if !strategy.is_active {
             panic_with_error!(env, Error::YieldStrategyNotInitialized);
+        }
+
+        let task = load_task(env, task_id).expect("Task not found");
+        if task.yield_strategy != Some(strategy_id) {
+            return Err(Error::InvalidYieldStrategy);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::YieldLiquidity(strategy_id))
+        {
+            return Self::harvest_yield_internal(env, task_id).map(|_| ());
         }
 
         // Check if we need to harvest (simplified logic)
@@ -8900,6 +9239,199 @@ impl SoroTaskContract {
     // Automated Insurance Vault Auto-Refill from Excess Protocol Profits (Issue #891)
     // ============================================================================
 
+    /// Purchases a task insurance policy for a 1% premium on the task's gas budget.
+    /// The premium is transferred into the contract and recorded as funded reserve.
+    pub fn purchase_task_insurance(
+        env: Env,
+        owner: Address,
+        task_id: u64,
+        coverage_amount: i128,
+    ) -> u64 {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        owner.require_auth();
+
+        let task = load_task(&env, task_id).expect("Task not found");
+        if task.creator != owner || coverage_amount <= 0 || coverage_amount > task.gas_balance {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::TaskInsurancePolicy(task_id))
+        {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let premium = insurance::premium_for_task_balance(task.gas_balance)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+        soroban_sdk::token::Client::new(&env, &token_address).transfer(
+            &owner,
+            &env.current_contract_address(),
+            &premium,
+        );
+        insurance::record_premium(&env, premium);
+
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsurancePolicyCounter)
+            .unwrap_or(0);
+        counter = counter.saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::InsurancePolicyCounter, &counter);
+        let policy = InsurancePolicy {
+            policy_id: counter,
+            owner: owner.clone(),
+            task_id,
+            premium_paid: premium,
+            coverage_amount,
+            status: ClaimStatus::Active,
+            created_at: env.ledger().timestamp(),
+            failure_reason: Bytes::new(&env),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(counter), &policy);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TaskInsurancePolicy(task_id), &counter);
+        assert_balance_invariant(&env);
+        env.events().publish(
+            (
+                Symbol::new(&env, "TaskInsurancePurchased"),
+                Symbol::new(&env, "v1"),
+                task_id,
+            ),
+            (counter, premium, coverage_amount),
+        );
+        exit_security_guard(&env);
+        counter
+    }
+
+    /// Records an admin-certified keeper fault for an insured task.
+    /// Certification requires the keeper's on-chain bond to be slashed.
+    pub fn certify_insurance_failure(
+        env: Env,
+        admin: Address,
+        task_id: u64,
+        keeper: Address,
+        failure_reason: Bytes,
+    ) {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        require_config_admin(&env, &admin);
+        if failure_reason.is_empty()
+            || load_task(&env, task_id).is_none()
+            || !env
+                .storage()
+                .persistent()
+                .has(&DataKey::TaskInsurancePolicy(task_id))
+        {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let bond: KeeperBond = env
+            .storage()
+            .persistent()
+            .get(&DataKey::KeeperBond(keeper.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InsuranceClaimNotCertified));
+        if !bond.is_slashed {
+            panic_with_error!(&env, Error::InsuranceClaimNotCertified);
+        }
+        env.storage().persistent().set(
+            &DataKey::InsuranceFaultProof(task_id),
+            &InsuranceFaultProof {
+                task_id,
+                keeper,
+                certified_by: admin,
+                failure_reason,
+                certified_at: env.ledger().timestamp(),
+            },
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Pays an insured task's certified claim immediately from funded reserves.
+    pub fn claim_task_insurance(env: Env, owner: Address, task_id: u64) -> i128 {
+        enter_security_guard(&env);
+        Self::check_feature_enabled(&env, FEATURE_INSURANCE);
+        owner.require_auth();
+
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaskInsurancePolicy(task_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        let mut policy: InsurancePolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InvalidInsurancePolicy));
+        if policy.owner != owner || policy.status != ClaimStatus::Active {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        if load_task(&env, task_id).is_none() {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+        let fault_proof: InsuranceFaultProof = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsuranceFaultProof(task_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::InsuranceClaimNotCertified));
+        if fault_proof.task_id != task_id {
+            panic_with_error!(&env, Error::InsuranceClaimNotCertified);
+        }
+        let payout = policy
+            .coverage_amount
+            .min(insurance::claimable_balance(&env));
+        if payout <= 0 {
+            panic_with_error!(&env, Error::InsuranceReserveInsufficient);
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .expect("Token not initialized");
+        soroban_sdk::token::Client::new(&env, &token_address).transfer(
+            &env.current_contract_address(),
+            &owner,
+            &payout,
+        );
+        insurance::record_claim_payment(&env, payout);
+        policy.status = ClaimStatus::Paid;
+        policy.failure_reason = fault_proof.failure_reason;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+        assert_balance_invariant(&env);
+        env.events().publish(
+            (
+                Symbol::new(&env, "TaskInsuranceClaimPaid"),
+                Symbol::new(&env, "v1"),
+                task_id,
+            ),
+            (policy_id, owner, payout),
+        );
+        exit_security_guard(&env);
+        payout
+    }
+
+    pub fn get_task_insurance_policy(env: Env, task_id: u64) -> Option<InsurancePolicy> {
+        let policy_id: u64 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TaskInsurancePolicy(task_id))?;
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+    }
+
     /// Diverts 15% protocol fee share to dedicated Insurance Vault storage upon task execution.
     pub fn refill_insurance_from_profit(env: Env, protocol_profit: i128) -> i128 {
         enter_security_guard(&env);
@@ -8935,6 +9467,9 @@ impl SoroTaskContract {
     /// Configures target reserve and returns updated solvency report.
     pub fn auto_balance_insurance_vault(env: Env, target_reserve: i128) -> InsuranceSolvencyReport {
         enter_security_guard(&env);
+        if target_reserve < 0 {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
         env.storage()
             .instance()
             .set(&DataKey::InsuranceTargetReserve, &target_reserve);
@@ -8944,11 +9479,7 @@ impl SoroTaskContract {
 
     /// Generates automated solvency reporting metrics for the insurance vault.
     pub fn get_insurance_vault_solvency(env: Env) -> InsuranceSolvencyReport {
-        let balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::InsuranceVaultBalance)
-            .unwrap_or(0);
+        let balance = insurance::solvency_balance(&env);
 
         let target: i128 = env
             .storage()
