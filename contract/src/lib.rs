@@ -3,24 +3,17 @@
 pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
-// Issue #777 investigation: this file previously declared
-// `pub mod access; pub mod execution; pub mod oracle; pub mod storage;
-// pub mod types; pub mod vrf; pub mod yield;` — none of those files
-// (src/access.rs, src/execution.rs, etc.) exist in this crate, and
-// `pub mod events;` was declared twice. Both are hard compile errors
-// ("file not found for module" / "the name `events` is defined multiple
-// times"), and nothing else in this file referenced any of the six
-// nonexistent modules by path — only the `pub use *` lines removed here
-// did. `events.rs` does exist and is kept, once.
 pub mod events;
 pub use events::*;
 pub mod math;
 pub mod dag;
 pub mod storage;
 pub mod task;
+pub mod resolver;
+pub mod mempool;
+pub mod ccip;
 pub mod admin;
 pub mod upgrade;
-pub mod mempool;
 #[cfg(test)]
 mod test_commit_reveal;
 
@@ -148,6 +141,7 @@ pub enum Error {
     GatewayNotConfigured = 703,
     GatewayUnauthorized = 704,
     CrossChainNonceReplay = 705,
+    MessageAlreadyExecuted = 706,
     // Commit-reveal execution protocol errors (SC-HARD-07)
     CommitmentRequired = 800,
     CommitmentAlreadyExists = 801,

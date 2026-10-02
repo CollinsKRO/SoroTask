@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Bytes, BytesN, Env, Symbol, Val, Vec};
+use soroban_sdk::{contracttype, Address, Bytes, BytesN32, Env, Symbol, Val, Vec};
 
 /// Represents the type of state change
 #[contracttype]
@@ -188,6 +188,21 @@ pub struct OracleVolatilityBreachEvent {
 #[derive(Clone, Debug)]
 pub struct VolatilityCircuitBreakerUnpausedEvent {
     pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Event payload for role grant / revoke / delegation audit trail.
+/// Emitted whenever a role is granted, revoked, or a time-bound
+/// delegation is created or expires.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct RoleChangedEvent {
+    pub admin: Address,
+    pub account: Address,
+    pub old_mask: u64,
+    pub new_mask: u64,
+    pub expires_at: u64,
+    pub action: Symbol,
     pub timestamp: u64,
 }
 
@@ -470,6 +485,36 @@ impl EventLogger {
         let topics = (
             Symbol::new(env, "sorotask"),
             Symbol::new(env, "volatility_unpaused"),
+        );
+        env.events().publish(topics, event_data);
+    }
+
+    /// Logs a role grant, revoke, or time-bound delegation change.
+    /// This provides the cryptographic audit trail for the RBAC system.
+    pub fn log_role_changed(
+        env: &Env,
+        admin: Address,
+        account: Address,
+        old_mask: u64,
+        new_mask: u64,
+        expires_at: u64,
+        action: Symbol,
+    ) {
+        let timestamp = env.ledger().timestamp();
+        let event_data = RoleChangedEvent {
+            admin: admin.clone(),
+            account: account.clone(),
+            old_mask,
+            new_mask,
+            expires_at,
+            action: action.clone(),
+            timestamp,
+        };
+
+        let topics = (
+            Symbol::new(env, "Role"),
+            action,
+            account,
         );
         env.events().publish(topics, event_data);
     }
