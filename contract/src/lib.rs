@@ -3,26 +3,47 @@
 pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
-// Issue #777 investigation: this file previously declared
-// `pub mod access; pub mod execution; pub mod oracle; pub mod storage;
-// pub mod types; pub mod vrf; pub mod yield;` — none of those files
-// (src/access.rs, src/execution.rs, etc.) exist in this crate, and
-// `pub mod events;` was declared twice. Both are hard compile errors
-// ("file not found for module" / "the name `events` is defined multiple
-// times"), and nothing else in this file referenced any of the six
-// nonexistent modules by path — only the `pub use *` lines removed here
-// did. `events.rs` does exist and is kept, once.
 pub mod events;
 pub use events::*;
 pub mod math;
 pub mod dag;
 pub mod storage;
 pub mod task;
+pub mod resolver;
+pub mod mempool;
+pub mod ccip;
 pub mod admin;
 pub mod upgrade;
+pub mod security;
+#[cfg(test)]
+mod test_commit_reveal;
 
 pub use storage::{TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
+
+/// Pending execution commitment posted by a keeper in the commit phase.
+/// Stores the hash of (keeper_address, task_id, secret, block_target)
+/// so the on-chain commitment cannot be front-run from the mempool.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ExecutionCommitment {
+    /// The keeper that posted this commitment
+    pub keeper: Address,
+    /// Task this commitment is for
+    pub task_id: u64,
+    /// SHA-256 of (keeper_xdr || task_id_le8 || secret || block_target_le4)
+    pub commitment_hash: BytesN<32>,
+    /// Ledger sequence at which the commitment was posted
+    pub commit_ledger: u32,
+    /// Bond amount locked (returned on successful reveal, forfeited on expiry)
+    pub bond_amount: i128,
+}
+
+/// Number of ledgers within which the keeper must reveal after committing.
+pub const COMMIT_REVEAL_WINDOW_LEDGERS: u32 = 3;
+
+/// Minimum bond a keeper must post with a commit (prevents spam).
+pub const MIN_COMMIT_BOND: i128 = 10;
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, xdr::ToXdr, Address,
@@ -121,6 +142,13 @@ pub enum Error {
     GatewayNotConfigured = 703,
     GatewayUnauthorized = 704,
     CrossChainNonceReplay = 705,
+    MessageAlreadyExecuted = 706,
+    // Commit-reveal execution protocol errors (SC-HARD-07)
+    CommitmentRequired = 800,
+    CommitmentAlreadyExists = 801,
+    CommitmentMismatch = 802,
+    RevealWindowExpired = 803,
+    CommitmentNotFound = 804,
 }
 
 #[contracttype]
@@ -1168,37 +1196,16 @@ pub enum DataKey {
     CrossChainTaskCounter,
     /// Cross-chain gateway: per-chain enabled flag
     CrossChainSourceEnabled(u32),
-}
-
-/// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
-pub struct ReentrancyGuard<'a>(&'a Env);
-
-impl<'a> ReentrancyGuard<'a> {
-    pub fn new(env: &'a Env) -> Self {
-        enter_security_guard(env);
-        Self(env)
-    }
-}
-
-impl<'a> Drop for ReentrancyGuard<'a> {
-    fn drop(&mut self) {
-        exit_security_guard(self.0);
-    }
+    /// Commit-reveal: pending commitment keyed by task_id (SC-HARD-07)
+    ExecutionCommitment(u64),
 }
 
 fn enter_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    if env.storage().temporary().has(&key) || env.storage().instance().has(&key) {
-        panic_with_error!(env, Error::ReentrantCall);
-    }
-    env.storage().temporary().set(&key, &true);
-    env.storage().instance().set(&key, &true);
+    security::enter(env);
 }
 
 fn exit_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    env.storage().temporary().remove(&key);
-    env.storage().instance().remove(&key);
+    security::exit(env);
 }
 
 /// Deterministic fingerprint for a task's identifying parameters, scoped per
@@ -4552,9 +4559,25 @@ impl SoroTaskContract {
     }
 
     pub fn execute(env: Env, keeper: Address, task_id: u64) {
-        enter_security_guard(&env);
+        // SC-HARD-07: Direct execution is only allowed when the caller has
+        // already posted a valid commitment via commit_execution(). This
+        // prevents mempool frontrunning by ensuring every execution was
+        // preceded by a private preimage commitment.
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        if !env.storage().persistent().has(&commitment_key) {
+            panic_with_error!(&env, Error::CommitmentRequired);
+        }
+        // Verify that the commitment belongs to this keeper
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentRequired));
+        if commitment.keeper != keeper {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        let _guard = security::ReentrancyGuard::new(&env);
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
     }
 
     /// Public permissionless entrypoint to bump task TTL with keeper incentive (Issue #1031)
@@ -4631,6 +4654,7 @@ impl SoroTaskContract {
         callback_fn: Symbol,
         callback_args: Vec<Val>,
     ) {
+        let _guard = security::ReentrancyGuard::new(&env);
         keeper.require_auth();
         extend_instance_ttl(&env);
         let task_key = DataKey::Task(task_id);
@@ -4654,9 +4678,7 @@ impl SoroTaskContract {
         }
 
         // Execute inner task execution atomically
-        enter_security_guard(&env);
         Self::execute_internal(&env, &keeper, task_id, true);
-        exit_security_guard(&env);
     }
 
     /// Verifies VDF proof difficulty and non-empty output integrity, ensuring un-cheatable
@@ -4673,12 +4695,11 @@ impl SoroTaskContract {
 
     /// Executes task after validating Verifiable Delay Function (VDF) proof.
     pub fn execute_with_vdf(env: Env, keeper: Address, task_id: u64, vdf_proof: VdfProof) -> bool {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         if !Self::verify_vdf_proof(env.clone(), vdf_proof, 100) {
             panic_with_error!(&env, Error::InvalidVdfProof);
         }
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
         true
     }
 
@@ -5640,7 +5661,7 @@ impl SoroTaskContract {
     /// Withdraws gas tokens from a task's balance.
     /// Only the task creator can withdraw.
     pub fn withdraw_gas(env: Env, task_id: u64, amount: i128) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let task_key = DataKey::Task(task_id);
         let mut config: TaskConfig = env
             .storage()
@@ -5681,12 +5702,11 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Cancels a task, refunds remaining gas, and removes it from storage.
     pub fn cancel_task(env: Env, task_id: u64) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let config: TaskConfig = load_task(&env, task_id).expect("Task not found");
 
         // Validate: Only creator can cancel
@@ -5747,7 +5767,6 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), refund_amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Permissionlessly refunds and removes an abandoned task (Issue #777).
@@ -8928,6 +8947,143 @@ impl SoroTaskContract {
         }
         Self::_is_cross_chain_nonce_used(&env, chain_id, nonce)
     }
+
+    // ─── Commit-Reveal Anti-Frontrunning Protocol (SC-HARD-07) ──────────────
+
+    /// Phase 1 – Commit. Keeper posts a hash commitment before executing.
+    /// `bond_amount` is debited from `DataKey::KeeperStake(keeper)`.
+    pub fn commit_execution(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        commitment_hash: BytesN<32>,
+        bond_amount: i128,
+    ) {
+        keeper.require_auth();
+
+        if bond_amount < MIN_COMMIT_BOND {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        if env.storage().persistent().has(&commitment_key) {
+            panic_with_error!(&env, Error::CommitmentAlreadyExists);
+        }
+
+        if !env.storage().persistent().has(&DataKey::Task(task_id)) {
+            panic_with_error!(&env, Error::TaskNotFound);
+        }
+
+        let stake_key = DataKey::KeeperStake(keeper.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0i128);
+        if current_stake < bond_amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+        env.storage().persistent().set(&stake_key, &(current_stake - bond_amount));
+
+        let commit_ledger = env.ledger().sequence();
+        let commitment = ExecutionCommitment {
+            keeper: keeper.clone(),
+            task_id,
+            commitment_hash: commitment_hash.clone(),
+            commit_ledger,
+            bond_amount,
+        };
+        env.storage().persistent().set(&commitment_key, &commitment);
+        env.storage().persistent().extend_ttl(&commitment_key, 100, 100);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExecutionCommitted"), Symbol::new(&env, "v1"), task_id),
+            (keeper, commitment_hash, commit_ledger),
+        );
+    }
+
+    /// Phase 2 – Reveal. Verifies the preimage, refunds bond, and executes.
+    pub fn reveal_execution(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        secret: Bytes,
+        block_target: u32,
+    ) {
+        keeper.require_auth();
+
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+
+        if commitment.keeper != keeper {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if !crate::mempool::is_within_reveal_window(
+            current_ledger,
+            commitment.commit_ledger,
+            COMMIT_REVEAL_WINDOW_LEDGERS,
+        ) {
+            panic_with_error!(&env, Error::RevealWindowExpired);
+        }
+
+        let valid = crate::mempool::verify_commitment(
+            &env, &keeper, task_id, &secret, block_target, &commitment.commitment_hash,
+        );
+        if !valid {
+            panic_with_error!(&env, Error::CommitmentMismatch);
+        }
+
+        // Refund bond
+        let stake_key = DataKey::KeeperStake(keeper.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0i128);
+        env.storage().persistent().set(&stake_key, &(current_stake + commitment.bond_amount));
+
+        env.storage().persistent().remove(&commitment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExecutionRevealed"), Symbol::new(&env, "v1"), task_id),
+            (keeper.clone(), current_ledger),
+        );
+
+        // Call execute_internal directly — the commitment was already verified and removed above,
+        // so we skip the commitment gate (skip_auth=true bypasses keeper.require_auth() as well
+        // since we already called keeper.require_auth() at the top of reveal_execution).
+        enter_security_guard(&env);
+        Self::execute_internal(&env, &keeper, task_id, true);
+        exit_security_guard(&env);
+    }
+
+    /// Forfeit an expired commitment (callable by anyone after window closes).
+    pub fn forfeit_expired_commitment(env: Env, task_id: u64) {
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+
+        let current_ledger = env.ledger().sequence();
+        // Reject forfeit attempt while the reveal window is still open
+        if crate::mempool::is_within_reveal_window(
+            current_ledger,
+            commitment.commit_ledger,
+            COMMIT_REVEAL_WINDOW_LEDGERS,
+        ) {
+            panic_with_error!(&env, Error::ChallengeWindowActive);
+        }
+
+        let vault_key = DataKey::InsuranceVaultBalance;
+        let vault: i128 = env.storage().persistent().get(&vault_key).unwrap_or(0i128);
+        env.storage().persistent().set(&vault_key, &(vault + commitment.bond_amount));
+        env.storage().persistent().remove(&commitment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "CommitmentForfeited"), Symbol::new(&env, "v1"), task_id),
+            (commitment.keeper, commitment.bond_amount, current_ledger),
+        );
+    }
 }
 
 // ============================================================================
@@ -8978,6 +9134,26 @@ pub(crate) mod tests {
         pub fn reenter_pause(env: Env, contract_id: Address, task_id: u64) {
             let client = SoroTaskContractClient::new(&env, &contract_id);
             client.pause_task(&task_id);
+        }
+    }
+
+    /// Target that attempts to cancel another task during its callback.
+    #[contract]
+    pub struct ReentrantTarget;
+
+    #[contractimpl]
+    impl ReentrantTarget {
+        pub fn attempt_cancel(env: Env, contract_id: Address, task_id: u64) {
+            let client = SoroTaskContractClient::new(&env, &contract_id);
+            let rejected = client.try_cancel_task(&task_id).is_err();
+            env.storage().instance().set(&Symbol::new(&env, "reentry_rejected"), &rejected);
+        }
+
+        pub fn was_reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "reentry_rejected"))
+                .unwrap_or(false)
         }
     }
 
@@ -9773,6 +9949,38 @@ pub(crate) mod tests {
         assert_eq!(stored.target, target);
         assert_eq!(stored.interval, 3_600);
         assert_eq!(stored.last_run, 0, "last_run must start at 0");
+    }
+
+    /// Reentry from an untrusted task callback is rejected while the outer
+    /// execution and ordinary target invocation complete successfully.
+    #[test]
+    fn test_malicious_target_cannot_reenter_cancel_task() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+        let keeper = Address::generate(&env);
+
+        let victim_target = env.register(MockTarget, ());
+        let victim_id = client.register(&base_config(&env, victim_target));
+
+        let attacker_target = env.register(ReentrantTarget, ());
+        let mut attacker_config = base_config(&env, attacker_target.clone());
+        attacker_config.function = Symbol::new(&env, "attempt_cancel");
+        attacker_config.args = vec![
+            &env,
+            id.clone().into_val(&env),
+            victim_id.into_val(&env),
+        ];
+        let attacker_id = client.register(&attacker_config);
+
+        set_timestamp(&env, 10_000);
+        client.execute(&keeper, &attacker_id);
+
+        let attacker_client = ReentrantTargetClient::new(&env, &attacker_target);
+        assert!(attacker_client.was_reentry_rejected());
+        assert!(client.get_task(&victim_id).is_some());
+
+        // A subsequent ordinary call remains possible after the guard drops.
+        client.execute(&keeper, &victim_id);
     }
 
     /// Querying a task id that was never registered returns None.

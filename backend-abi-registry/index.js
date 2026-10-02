@@ -5,12 +5,16 @@ const errorCodes = require('./errorCodes');
 const Monitor = require('./monitor');
 const { AbiCache } = require('./abiCache');
 const { TaskFlowGraph } = require('./taskFlowGraph');
+const { validateEnv } = require('./envValidator');
+const { createSigner } = require('./signer');
 
 class ABIRegistryService {
   constructor(options = {}) {
+    validateEnv(process.env);
     this.monitor = new Monitor(parser, registry);
     this.cache = options.cache || new AbiCache(options);
     this.taskFlowGraph = new TaskFlowGraph();
+    this.signer = options.signer || createSigner(options.signerConfig || {});
     this.indexerEvents = null;
     if (options.indexerEvents) this.attachIndexerEvents(options.indexerEvents);
   }
@@ -62,6 +66,14 @@ class ABIRegistryService {
     return abi;
   }
 
+  getSigner() {
+    return this.signer;
+  }
+
+  async signTransaction(payload) {
+    return this.signer.sign(payload);
+  }
+
   async invalidateOnIndexerEvent(event) {
     return this.cache.handleIndexerEvent(event);
   }
@@ -75,4 +87,4 @@ class ABIRegistryService {
   }
 }
 
-module.exports = new ABIRegistryService();
+module.exports = new ABIRegistryService({ signerConfig: { networkPassphrase: process.env.NETWORK_PASSTHRAPE || process.env.STELLAR_NETWORK_PASSTHRAPE } });
