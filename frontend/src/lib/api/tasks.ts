@@ -407,6 +407,27 @@ export async function cancelTask(id: string, userAddress?: string, contractId?: 
   return { id };
 }
 
+export async function executeTask(
+  id: string,
+  userAddress?: string,
+  contractId?: string,
+): Promise<{ id: string; status: TaskStatus; txHash?: string }> {
+  if (userAddress && contractId) {
+    const { SorobanService } = await import("../../../app/lib/soroban.service");
+    const soroban = new SorobanService();
+    const { nativeToScVal } = await import("@stellar/stellar-sdk");
+    const taskIdU64 = BigInt(id.replace(/\D/g, "") || "0");
+    const response = await soroban.executeContractCall({
+      publicKey: userAddress,
+      contractId,
+      method: "execute_task",
+      args: [nativeToScVal(taskIdU64, { type: "u64" })],
+    });
+    return { id, status: "running", txHash: response.txHash };
+  }
+
+  return { id, status: "running" };
+
 // Batch lifecycle mutations — one atomic transaction per batch action
 
 export async function pauseTasksBulk(
