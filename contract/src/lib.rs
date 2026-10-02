@@ -20,6 +20,7 @@ pub mod storage;
 pub mod task;
 pub mod admin;
 pub mod upgrade;
+pub mod ccip;
 
 pub use storage::{TaskMeta, TaskPayload, TaskStats};
 pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
@@ -121,6 +122,7 @@ pub enum Error {
     GatewayNotConfigured = 703,
     GatewayUnauthorized = 704,
     CrossChainNonceReplay = 705,
+    MessageAlreadyExecuted = 706,
 }
 
 #[contracttype]
