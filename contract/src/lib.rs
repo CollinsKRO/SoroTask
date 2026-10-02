@@ -1,17 +1,8 @@
 #![no_std]
 
+pub mod rate_limiter;
 pub mod access;
 pub mod packed_args;
-pub mod rate_limiter;
-// Issue #777 investigation: this file previously declared
-// `pub mod access; pub mod execution; pub mod oracle; pub mod storage;
-// pub mod types; pub mod vrf; pub mod yield;` — none of those files
-// (src/access.rs, src/execution.rs, etc.) exist in this crate, and
-// `pub mod events;` was declared twice. Both are hard compile errors
-// ("file not found for module" / "the name `events` is defined multiple
-// times"), and nothing else in this file referenced any of the six
-// nonexistent modules by path — only the `pub use *` lines removed here
-// did. `events.rs` does exist and is kept, once.
 pub mod events;
 pub use events::*;
 pub mod admin;
@@ -21,1196 +12,21 @@ pub mod storage;
 pub mod task;
 pub mod upgrade;
 pub mod zk;
-
-pub use storage::{TaskMeta, TaskPayload, TaskStats};
-pub use upgrade::{UpgradeProposal, UPGRADE_TIMELOCK_SECONDS};
-
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, xdr::ToXdr, Address,
-    Bytes, BytesN, Env, IntoVal, Symbol, TryFromVal, TryIntoVal, Val, Vec,
-};
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum Error {
-    InvalidInterval = 1,
-    Unauthorized = 2,
-    InsufficientBalance = 3,
-    NotInitialized = 4,
-    TaskPaused = 5,
-    TaskAlreadyPaused = 6,
-    TaskAlreadyActive = 7,
-    SelfDependency = 8,
-    DependencyNotFound = 9,
-    CircularDependency = 10,
-    DependencyBlocked = 11,
-    AlreadyInitialized = 12,
-    UnauthorizedSlasher = 13,
-    KeeperStakeTooLow = 14,
-    OperatorAlreadySet = 15,
-    InvalidPayload = 16,
-    ReentrantCall = 17,
-    DependencyLimitExceeded = 18,
-    DependencyDepthExceeded = 19,
-    VrfOracleNotSet = 20,
-    InvalidVrfRequest = 21,
-    VrfRequestFailed = 22,
-    VrfAlreadyFulfilled = 23,
-    YieldStrategyNotInitialized = 24,
-    InvalidYieldStrategy = 25,
-    YieldHarvestFailed = 26,
-    InsufficientYield = 27,
-    OracleNotSet = 28,
-    OracleRequestFailed = 29,
-    OracleInvalidResponse = 30,
-    OracleTimeout = 31,
-    OracleUnsupportedProvider = 32,
-    InvalidInsurancePolicy = 33,
-    ArgsTooMany = 34,
-    ArgsTooLarge = 35,
-    TaskNotFound = 36,
-    InvalidUpgradeVersion = 37,
-    DuplicateTask = 38,
-    BountyBelowMinimum = 39,
-    InvalidBounty = 40,
-    FeatureDisabled = 41,
-    InvalidZkProof = 42,
-    FlashSwapFailed = 43,
-    InsufficientFlashProfit = 44,
-    InvalidSlippage = 45,
-    OptimisticClaimPending = 46,
-    NoOptimisticClaim = 47,
-    ChallengeWindowClosed = 48,
-    ChallengeWindowActive = 49,
-    FraudProofInvalid = 50,
-    EmptyBundle = 51,
-    BundleTooLarge = 52,
-    BundleStepFailed = 53,
-    BlockExecutionLimitReached = 54,
-    DecryptionFailed = 55,
-    InsufficientDelegation = 56,
-    InvalidCommissionRate = 57,
-    InvalidVdfProof = 58,
-    UpgradeNotProposed = 59,
-    UpgradeTimelockActive = 60,
-    // Oracle freshness / multi-oracle errors (Issues #1040, #1041)
-    OracleStale = 411,
-    OracleDeviationExceeded = 412,
-    InsufficientOracleFeeds = 413,
-    // VRF commit-reveal errors (Issue #1042)
-    VrfFulfillmentTooEarly = 414,
-    VrfFulfillmentExpired = 415,
-    VrfCommitAlreadyRevealed = 416,
-    InvalidVrfCommit = 417,
-    // Keeper bonding errors (Issue #1043)
-    KeeperBondInsufficient = 418,
-    KeeperSlashed = 419,
-    KeeperNotBonded = 420,
-    VolatilityExceeded = 600,
-    VolatilityCircuitBreakerTripped = 601,
-    VolatilityTimelockActive = 602,
-    UnpauseNotProposed = 65,
-    UnpauseTimelockActive = 66,
-    InvalidPauseThreshold = 67,
-    TaskStillActive = 68,
-    AbandonmentPeriodNotElapsed = 69,
-    // Cross-chain errors
-    UnsupportedSourceChain = 700,
-    InvalidCrossChainPayload = 701,
-    InvalidCrossChainSignature = 702,
-    GatewayNotConfigured = 703,
-    GatewayUnauthorized = 704,
-    CrossChainNonceReplay = 705,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum OracleProvider {
-    Chainlink,
-    Band,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleConfig {
-    pub address: Address,
-    pub provider: OracleProvider,
-    pub active: bool,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum OracleRequestStatus {
-    Pending,
-    Fulfilled,
-    Failed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleDataRequest {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub requester: Address,
-    pub provider: OracleProvider,
-    pub job_id: Symbol,
-    pub callback_function: Symbol,
-    pub callback_args: Vec<Val>,
-    pub status: OracleRequestStatus,
-    pub created_at: u64,
-    pub max_retries: u32,
-    pub retry_count: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleDataResponse {
-    pub request_id: u64,
-    pub data: Bytes,
-    pub timestamp: u64,
-    pub provider: OracleProvider,
-}
-
-/// An individual oracle price feed entry for multi-oracle aggregation (Issue #1041).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OracleFeed {
-    pub provider: OracleProvider,
-    pub price: i128,
-    pub timestamp: u64,
-    pub decimals: u32,
-}
-
-/// A committed VRF seed for the commit-reveal scheme (Issue #1042).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfCommit {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub commit_hash: BytesN<32>,
-    pub committed_by: Address,
-    pub committed_at_ledger: u32,
-    pub revealed: bool,
-}
-
-/// Keeper economic bond record (Issue #1043).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperBond {
-    pub keeper: Address,
-    pub bonded_amount: i128,
-    pub bonded_at: u64,
-    pub is_slashed: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ProxyConfig {
-    pub admin: Address,
-    pub version: u32,
-    pub implementation_hash: Option<BytesN<32>>,
-    pub upgrade_count: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct UpgradeRecord {
-    pub previous_version: u32,
-    pub new_version: u32,
-    pub implementation_hash: BytesN<32>,
-    pub upgraded_by: Address,
-    pub upgraded_at: u64,
-}
-pub trait AddressExt {
-    fn current(env: &Env) -> Address;
-}
-
-impl AddressExt for Address {
-    fn current(env: &Env) -> Address {
-        env.current_contract_address()
-    }
-}
-
-/// Maximum number of arguments allowed in a task payload
-const MAX_ARGS_COUNT: u32 = 32;
-
-/// Maximum serialized size of arguments in bytes (approx 4KB limit for Soroban)
-const MAX_ARGS_SIZE_BYTES: u32 = 4096;
-
-const FIXED_EXECUTION_FEE: i128 = 100;
-const MAX_DEPENDENCIES_PER_TASK: u32 = 8;
-const MAX_DEPENDENCY_DEPTH: u32 = 5;
-/// Maximum number of tasks allowed per ledger block for rate limiting
-const MAX_TASKS_PER_BLOCK: u32 = 50;
-/// Maximum number of tasks allowed in a single batch execution
-const MAX_BATCH_SIZE: u32 = 100;
-
-/// Maximum number of steps allowed in a single atomic task bundle
-const MAX_BUNDLE_STEPS: u32 = 16;
-
-// ── Cross-Chain Interoperability Protocol (CCIP) Gateway (Issue #814) ──────
-/// Maximum allowed payload size for cross-chain messages (bytes)
-const MAX_CROSS_CHAIN_PAYLOAD_SIZE: u32 = 4096;
-/// Maximum age (seconds) of a cross-chain message before it is considered stale
-const CROSS_CHAIN_MAX_MESSAGE_AGE: u64 = 3_600;
-/// Number of confirmations required on the source chain
-const CROSS_CHAIN_MIN_CONFIRMATIONS: u64 = 1;
-/// Ledgers a submitted optimistic resolver-condition claim stays open to
-/// challenge before it can be finalized.
-const OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS: u32 = 100;
-/// Minimum bond a keeper must post to submit an optimistic claim.
-const MIN_OPTIMISTIC_BOND: i128 = 100;
-
-/// Maximum age in seconds for oracle price feed data before it is considered stale (Issue #1040).
-const MAX_ORACLE_DELAY_SECONDS: u64 = 300;
-
-/// Maximum deviation between oracle feeds in basis points before halting execution (Issue #1041).
-const MAX_ORACLE_DEVIATION_BPS: u32 = 250;
-
-/// Default delay seconds for VRF commit-reveal (Issue #1042). Admin can override.
-/// Defaults to 0 (disabled) to preserve backward compatibility.
-const DEFAULT_VRF_DELAY_SECONDS: u64 = 0;
-
-/// Default expiration seconds for VRF fulfillment window (Issue #1042). Admin can override.
-/// Defaults to 0 (disabled) to preserve backward compatibility.
-const DEFAULT_VRF_EXPIRATION_SECONDS: u64 = 0;
-
-/// Minimum stake a keeper must bond to claim restricted tasks (Issue #1043), in token units.
-const MIN_KEEPER_STAKE: i128 = 500;
-
-/// State Archival TTL Extension Thresholds (Issue #1031)
-pub const MIN_THRESHOLD_LEDGERS: u32 = 100_000;
-pub const EXTEND_TO_LEDGERS: u32 = 500_000;
-/// Delay between a governance-approved unpause proposal reaching quorum and
-/// when it becomes executable via `execute_unpause` (Issue #774).
-pub const UNPAUSE_TIMELOCK_SECONDS: u64 = 86_400;
-
-/// Permission Bitmask Flags for Task RBAC
-pub const PERM_CAN_PAUSE: u32 = 1;
-pub const PERM_CAN_UPDATE: u32 = 2;
-pub const PERM_CAN_CANCEL: u32 = 4;
-pub const PERM_CAN_DEPOSIT: u32 = 8;
-
-/// Issue #777: minimum time an inactive task must sit untouched (since
-/// `last_run`) before anyone (not just the creator) may permissionlessly
-/// trigger `refund_inactive_task` and reclaim its locked gas deposit. Set
-/// well above any legitimate pause-then-resume workflow so a creator who
-/// pauses a task and comes back a day later never has it refunded out
-/// from under them.
-pub const INACTIVE_TASK_ABANDONMENT_SECONDS: u64 = 60 * 60 * 24 * 90; // 90 days
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskConfig {
-    pub creator: Address,
-    pub target: Address,
-    pub function: Symbol,
-    pub args: Vec<Val>,
-    pub resolver: Option<Address>,
-    /// Minimum seconds between executions. `u32` is sufficient here (max
-    /// ~136 years) - unlike `last_run`, which is a ledger timestamp and must
-    /// stay `u64` to match `env.ledger().timestamp()`.
-    pub interval: u32,
-    pub last_run: u64,
-    pub gas_balance: i128,
-    pub whitelist: Vec<Address>,
-    pub is_active: bool,
-    pub blocked_by: Vec<u64>,
-    /// Optional yield strategy ID for automated yield harvesting
-    pub yield_strategy: Option<u64>,
-    /// Gas-optimized bitmask vector for role-based permissions
-    pub permissions: u32,
-}
-
-/// A single invocation within a [`TaskBundle`]: `target::function(args)`.
-///
-/// When `forward_result` is `true`, the `Val` returned by this step's
-/// invocation is appended as the final argument of the *next* step's `args`,
-/// letting one dApp call (e.g. a DEX swap) feed its output into the next
-/// (e.g. a lending deposit).
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskStep {
-    pub target: Address,
-    pub function: Symbol,
-    pub args: Vec<Val>,
-    pub forward_result: bool,
-}
-
-/// Per-step outcome recorded after an atomic bundle execution completes,
-/// for off-chain introspection of what each leg of the bundle returned.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BundleStepOutcome {
-    pub target: Address,
-    pub function: Symbol,
-    pub succeeded: bool,
-}
-
-/// Record of a completed atomic multi-task bundle execution.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BundleExecutionRecord {
-    pub bundle_id: u64,
-    pub initiator: Address,
-    pub timestamp: u64,
-    pub steps: Vec<BundleStepOutcome>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TaskDependency {
-    pub task_id: u64,
-    pub depends_on: u64,
-}
-
-/// Encrypted parameter payload for privacy-preserving task execution.
-/// The ciphertext is encrypted with the contract's public key and can
-/// only be decrypted in-memory during execution.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EncryptedPayload {
-    /// The encrypted ciphertext of the parameter
-    pub ciphertext: Bytes,
-    /// The nonce used for encryption
-    pub nonce: BytesN<24>,
-    /// The public key of the encryption scheme
-    pub public_key: BytesN<32>,
-    /// The encryption scheme identifier (e.g. "kyber", "ml-kem")
-    pub encryption_scheme: Symbol,
-}
-
-/// Invalidation hook registration for upstream protocol upgrade detection.
-/// When a target contract upgrades its WASM logic, the hook is triggered
-/// to pause or re-validate the associated task.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct InvalidationHook {
-    /// The target contract address that this hook monitors
-    pub target_contract: Address,
-    /// The callback function name to invoke on the target contract
-    /// when an upgrade is detected
-    pub callback_fn: Symbol,
-    /// Timestamp when the hook was registered
-    pub registered_at: u64,
-    /// Whether the hook is currently active
-    pub is_active: bool,
-}
-
-/// Delegation pool entry mapping a delegator to a keeper operator.
-/// Token holders can delegate stake to trusted keepers and earn a share
-/// of execution bounties minus the operator commission.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct DelegationPool {
-    /// The address of the delegator
-    pub delegator: Address,
-    /// The address of the keeper operator
-    pub keeper: Address,
-    /// The amount of stake delegated
-    pub amount: i128,
-    /// The operator commission rate in basis points (0-10000)
-    pub commission_rate: u32,
-    /// Timestamp when the delegation was created
-    pub created_at: u64,
-    /// Whether the delegation is active
-    pub is_active: bool,
-}
-
-/// Per-block execution tracking record for rate limiting.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct BlockExecutionRecord {
-    /// The ledger sequence number this record corresponds to
-    pub ledger_sequence: u32,
-    /// The number of task executions in this block
-    pub execution_count: u32,
-}
-
-/// State channel configuration
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannel {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Participants in the channel
-    pub participants: Vec<Address>,
-    /// Current balances for each participant
-    pub balances: Vec<i128>,
-    /// Last settlement timestamp
-    pub last_settlement: u64,
-    /// Settlement interval (in seconds)
-    pub settlement_interval: u64,
-    /// Is the channel active
-    pub is_active: bool,
-    /// Channel nonce for update verification
-    pub nonce: u64,
-}
-
-/// State channel update containing off-chain computation results
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannelUpdate {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Update nonce (must be greater than previous nonce)
-    pub nonce: u64,
-    /// Hash of the updated state
-    pub state_hash: Bytes,
-    /// Micro-tasks to execute as part of this settlement
-    pub micro_tasks: Vec<ExecutableTask>,
-    /// Timestamp of the update
-    pub updated_at: u64,
-    /// Signature from participants (for verification)
-    pub signature: Bytes,
-}
-
-/// State channel settlement record
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StateChannelSettlement {
-    /// Channel ID
-    pub channel_id: u64,
-    /// Settlement ID
-    pub settlement_id: u64,
-    /// Nonce used for this settlement
-    pub nonce: u64,
-    /// Timestamp of settlement
-    pub settled_at: u64,
-    /// Tasks executed during settlement
-    pub executed_tasks: Vec<u64>,
-    /// Settlement fee paid
-    pub settlement_fee: i128,
-}
-
-/// Verifiable Delay Function (VDF) proof struct for un-cheatable execution delays
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct VdfProof {
-    pub output: Bytes,
-    pub difficulty: u64,
-    pub seed: Bytes,
-}
-
-/// Role enumeration for granular access control
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Role {
-    Admin,
-    Keeper,
-    Delegate,
-    Viewer,
-    Auditor,
-}
-
-/// Permission enumeration for fine-grained access control
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Permission {
-    TaskCreate,
-    TaskExecute,
-    TaskManage,
-    PortfolioManage,
-    GovernanceVote,
-    GovernancePropose,
-    KeeperRegister,
-    KeeperDelegated,
-    AdminAccess,
-}
-
-/// Role assignment for an address
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct RoleAssignment {
-    /// Address that has been assigned a role
-    pub address: Address,
-    /// The role assigned to this address
-    pub role: Role,
-    /// Timestamp when the role was assigned
-    pub assigned_at: u64,
-    /// Optional expiration timestamp (0 for no expiration)
-    pub expires_at: u64,
-}
-
-/// Permission grant for specific permissions
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct PermissionGrant {
-    /// Address that has been granted permissions
-    pub address: Address,
-    /// List of permissions granted
-    pub permissions: Vec<Permission>,
-    /// Timestamp when permissions were granted
-    pub granted_at: u64,
-    /// Optional expiration timestamp (0 for no expiration)
-    pub expires_at: u64,
-}
-
-/// Delegation record for permission delegation
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Delegation {
-    /// Address that delegated permissions
-    pub delegator: Address,
-    /// Address that received delegated permissions
-    pub delegatee: Address,
-    /// List of permissions delegated
-    pub permissions: Vec<Permission>,
-    /// Timestamp when delegation was created
-    pub created_at: u64,
-    /// Expiration timestamp for delegation
-    pub expires_at: u64,
-    /// Whether delegation is revocable
-    pub is_revocable: bool,
-}
-
-/// Keeper reputation tracking structure
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperReputation {
-    /// Address of the keeper
-    pub address: Address,
-    /// Current reputation score (0-1000 scale)
-    pub score: u64,
-    /// Total number of task executions attempted
-    pub execution_count: u64,
-    /// Number of successful task executions
-    pub success_count: u64,
-    /// Number of failed task executions
-    pub failure_count: u64,
-    /// Timestamp of last reputation update
-    pub last_updated: u64,
-    /// Optional notes about reputation history
-    pub notes: Bytes,
-}
-
-/// Keeper reputation history record
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperReputationHistory {
-    /// Address of the keeper
-    pub address: Address,
-    /// Reputation score at this point in time
-    pub score: u64,
-    /// Timestamp of this reputation snapshot
-    pub timestamp: u64,
-    /// Reason for reputation change
-    pub reason: Bytes,
-    /// Previous score before change
-    pub previous_score: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionOutcome {
-    NeverRun,
-    Success,
-    Failed,
-    Skipped,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskExecutionStatus {
-    pub outcome: ExecutionOutcome,
-    pub completed_at: u64,
-    pub run_count: u64,
-}
-
-/// On-chain record of the execution trace for one task run.
-/// Stored so off-chain consumers can retrieve the full step-by-step
-/// path and identify exactly which condition caused a failure.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExecutionTrace {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub timestamp: u64,
-    pub steps: Vec<events::ExecutionStepRecord>,
-    pub final_outcome: ExecutionOutcome,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DependencyOutcome {
-    AnyCompletion,
-    Success,
-    Skipped,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DependencyRule {
-    pub task_id: u64,
-    pub required_outcome: DependencyOutcome,
-    pub min_completed_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct Portfolio {
-    pub creator: Address,
-    pub name: Bytes,
-    pub description: Bytes,
-    pub created_at: u64,
-    pub is_active: bool,
-    pub task_count: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum PortfolioOperation {
-    Pause,
-    Resume,
-    Fund,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StakingPool {
-    pub total_staked: i128,
-    pub stakers_count: u64,
-    pub reward_rate: i128,
-    pub last_reward_timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-/// Portfolio statistics and analytics
-pub struct PortfolioStatistics {
-    /// Portfolio ID
-    pub portfolio_id: u64,
-    /// Total number of tasks in portfolio
-    pub task_count: u64,
-    /// Number of active tasks
-    pub active_task_count: u64,
-    /// Total number of task executions
-    pub total_executions: u64,
-    /// Timestamp of last task execution
-    pub last_execution_timestamp: u64,
-    /// Portfolio creation timestamp
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-/// Configuration for yield harvesting strategies
-pub struct YieldStrategyConfig {
-    /// Address of the DeFi protocol contract to harvest from
-    pub protocol_address: Address,
-    /// Function name to call for harvesting
-    pub harvest_function: Symbol,
-    /// Function name to call for compounding
-    pub compound_function: Symbol,
-    /// Additional arguments for harvest function
-    pub harvest_args: Vec<Val>,
-    /// Additional arguments for compound function
-    pub compound_args: Vec<Val>,
-    /// Minimum yield threshold to trigger harvest
-    pub min_yield_threshold: i128,
-    /// Maximum gas fee allowed for harvest operation
-    pub max_gas_fee: i128,
-    /// Strategy creation timestamp
-    pub created_at: u64,
-    /// Whether strategy is active
-    pub is_active: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct StakingBalance {
-    pub address: Address,
-    pub amount: i128,
-    pub last_stake_timestamp: u64,
-    pub accumulated_rewards: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct GovernanceProposal {
-    pub proposer: Address,
-    pub title: Bytes,
-    pub description: Bytes,
-    pub created_at: u64,
-    pub expires_at: u64,
-    pub status: ProposalStatus,
-    pub votes_for: i128,
-    pub votes_against: i128,
-    pub quorum: i128,
-    pub proposal_type: ProposalType,
-    pub payload: Vec<Val>,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ProposalType {
-    UpdateTokenomicsConfig,
-    UpdateFeeModel,
-    UpdateStakingParameters,
-    Other,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ProposalStatus {
-    Active,
-    Passed,
-    Rejected,
-    Executed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VotingPower {
-    pub address: Address,
-    pub voting_power: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TokenomicsConfig {
-    pub staking_reward_rate: i128,
-    pub governance_quorum_percentage: i128,
-    pub governance_voting_period: u64,
-    pub fee_model: FeeModel,
-    pub min_fee: i128,
-    pub max_fee: i128,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct NetworkMetrics {
-    pub last_24h_transaction_count: u64,
-    pub avg_gas_price_last_hour: i128,
-    pub current_congestion_level: u32, // 0-100 scale
-    pub last_updated: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct KeeperMetrics {
-    pub active_keepers_count: u64,
-    pub total_keepers_registered: u64,
-    pub avg_response_time_ms: u64,
-    pub last_updated: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum FeeModel {
-    Fixed,
-    Percentage,
-    Dynamic,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfRequest {
-    pub request_id: u64,
-    pub task_id: u64,
-    pub requester: Address,
-    pub callback_function: Symbol,
-    pub callback_args: Vec<Val>,
-    pub status: VrfRequestStatus,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum VrfRequestStatus {
-    Pending,
-    Fulfilled,
-    Failed,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfResponse {
-    pub request_id: u64,
-    pub random_number: i128,
-    pub proof: Bytes,
-    pub fulfilled_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct VrfKeeperAssignment {
-    pub task_id: u64,
-    pub request_id: u64,
-    pub keepers: Vec<Address>,
-    pub winner: Option<Address>,
-    pub random_number: Option<i128>,
-    pub requested_at: u64,
-    pub fulfilled_at: u64,
-}
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ClaimStatus {
-    Active,
-    Submitted,
-    Paid,
-    Rejected,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct InsurancePolicy {
-    pub policy_id: u64,
-    pub owner: Address,
-    pub task_id: u64,
-    pub premium_paid: i128,
-    pub coverage_amount: i128,
-    pub status: ClaimStatus,
-    pub created_at: u64,
-    pub failure_reason: Bytes,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ZkCondition {
-    pub task_id: u64,
-    pub condition_hash: Bytes,
-    pub zk_proof: Bytes,
-    pub verifier_address: Address,
-    pub created_at: u64,
-    pub is_verified: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct EmergencyPauseState {
-    pub is_paused: bool,
-    pub paused_at: u64,
-    pub pause_duration: u64,
-}
-
-// Feature flag bitmask constants
-pub const FEATURE_YIELD_STRATEGY: u32 = 1 << 0;
-pub const FEATURE_FLASH_LOAN: u32 = 1 << 1;
-pub const FEATURE_VRF: u32 = 1 << 2;
-pub const FEATURE_INSURANCE: u32 = 1 << 3;
-pub const FEATURE_STATE_CHANNEL: u32 = 1 << 4;
-pub const FEATURE_ZK_RANGE_PROOF: u32 = 1 << 5;
-pub const DEFAULT_FEATURE_FLAGS: u32 = 0xFFFFFFFF;
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct ZkRangeProof {
-    pub task_id: u64,
-    pub min_val: i128,
-    pub max_val: i128,
-    pub commitment: BytesN<32>,
-    pub proof: Bytes,
-    pub verifier: Address,
-    pub is_verified: bool,
-    pub created_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct DynamicBountyConfig {
-    pub enabled: bool,
-    pub base_bounty: i128,
-    pub interval: u32,
-    pub max_multiplier_bps: u32,
-    pub growth_rate_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct FlashSwapParams {
-    pub dex_router: Address,
-    pub token_borrow: Address,
-    pub amount_borrow: i128,
-    pub token_repay: Address,
-    pub min_profit: i128,
-    pub flash_fee_bps: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct FlashSwapExecution {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub params: FlashSwapParams,
-    pub profit: i128,
-    pub timestamp: u64,
-}
-
-/// A keeper's standing preference for how their execution fee is paid out.
-/// When set, `PayKeeper` routes the fee through `router` into `payout_token`
-/// instead of paying it in the contract's single global gas token.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KeeperPayoutPreference {
-    pub payout_token: Address,
-    pub router: Address,
-    /// Maximum acceptable slippage in basis points (0-10000) applied to the
-    /// router's quoted output when deriving `min_amount_out` for the swap.
-    pub max_slippage_bps: u32,
-}
-
-/// An optimistically-submitted resolver condition claim, bonded by the
-/// submitting keeper and open to challenge for `OPTIMISTIC_CHALLENGE_WINDOW_LEDGERS`.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct OptimisticExecution {
-    pub task_id: u64,
-    pub keeper: Address,
-    pub bond: i128,
-    pub claimed_condition_result: bool,
-    pub submitted_at_ledger: u32,
-    pub resolved: bool,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RandomSeedRotation {
-    pub current_seed: BytesN<32>,
-    pub last_updated_ledger: u32,
-    pub last_updated_timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InsuranceSolvencyReport {
-    pub total_vault_balance: i128,
-    pub target_reserve: i128,
-    pub solvency_ratio_bps: u32,
-    pub is_solvent: bool,
-}
-
-/// Supported cross-chain source networks for the CCIP Trigger Gateway.
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum CrossChainSource {
-    Ethereum = 1,
-    Solana = 2,
-    Polygon = 3,
-    Bsc = 4,
-}
-
-/// Decoded cross-chain task payload emitted with the `CrossChainTaskScheduled` event.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct CrossChainTaskPayload {
-    pub task_id: u64,
-    pub source_chain: Symbol,
-    pub sender: Bytes,
-    pub nonce: u64,
-    pub received_at: u64,
-}
-
-/// Persistent record of a received cross-chain task, stored for audit and query.
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct CrossChainTaskRecord {
-    pub task_id: u64,
-    pub source_chain: Symbol,
-    pub sender: Bytes,
-    pub nonce: u64,
-    pub received_at: u64,
-}
-
-#[contracttype]
-pub enum DataKey {
-    Guardians,
-    PauseSignatures,
-    EmergencyPauseState,
-    /// Configurable K-of-N threshold for `emergency_pause` guardian signatures (Issue #774)
-    PauseThreshold,
-    /// Timestamp at which a pending governance-approved unpause becomes executable
-    UnpauseTimelock,
-    /// Whether a governance unpause proposal is currently pending
-    UnpauseProposed,
-    Task(u64),
-    TaskMeta(u64),
-    TaskPayload(u64),
-    /// Leaky bucket keyed by target contract address (Issue #1192).
-    TargetInvocationBucket(Address),
-    TaskStats(u64),
-    StorageSchemaVersion,
-    UpgradeProposal,
-    /// Per-task delegated permission bitmask for a non-creator address
-    /// (Issue #778). Same bit layout as `TaskConfig.permissions`
-    /// (`PERM_CAN_PAUSE` etc.) — absence means no delegated access.
-    TaskDelegate(u64, Address),
-    Counter,
-    ActiveTasks,
-    Token,
-    Operator,
-    KeeperStake(Address),
-    TaskDependencies(u64),
-    TaskStatus(u64),
-    DependencyRules(u64),
-    /// Existence marker keyed by `task_fingerprint(creator, target, function, args, interval)`,
-    /// used to reject duplicate registrations. See `register`/`cancel_task`.
-    TaskFingerprint(BytesN<32>),
-    Portfolio(u64),
-    PortfolioTasks(u64),
-    PortfolioCounter,
-    StakingPool,
-    StakingBalance(Address),
-    GovernanceProposal(u64),
-    GovernanceProposalCounter,
-    GovernanceVotingPower(Address),
-    TokenomicsConfig,
-    FeeRecipient,
-    ProtocolFeeBps,
-    VrfOracleAddress,
-
-    VrfRequestCounter,
-    VrfRequests(u64),
-    VrfResponses(u64),
-    VrfKeeperAssignment(u64),
-    OracleConfig(OracleProvider),
-    OracleRequestCounter,
-    OracleRequests(u64),
-    OracleResponses(u64),
-    InsurancePolicyCounter,
-    InsurancePolicy(u64),
-    YieldStrategyCounter,
-    YieldStrategies(u64),
-    ReentrancyLock,
-    ZkConditions(u64),
-    ZkConditionCounter,
-    NetworkMetrics,
-    KeeperMetrics,
-    AdminAddress,
-    ProxyConfig,
-    UpgradeRecord(u64),
-    StateChannel(u64),
-    StateChannelCounter,
-    StateChannelUpdates(u64),
-    StateChannelUpdateCounter,
-    StateChannelSettlements(u64),
-    StateChannelSettlementCounter,
-    RoleAssignments(Address),
-    PermissionGrants(Address),
-    Delegations(Address),
-    VoteDelegation(Address),
-    RoleAssignmentCounter,
-    PermissionGrantCounter,
-    DelegationCounter,
-    KeeperReputation(Address),
-    KeeperReputationCounter,
-    ExecutionTrace(u64),
-    MinBounty,
-    FeatureFlags,
-    KeeperPayoutPreference(Address),
-    OptimisticExecution(u64),
-    ZkRangeProofs(u64),
-    ZkRangeProofCounter,
-    TaskDynamicBounty(u64),
-    FlashSwapRecord(u64),
-    MaxVolatilityBps,
-    LastOraclePrice,
-    VolatilityCircuitBreakerTripped,
-    VolatilityUnpauseTimelock,
-    FlashSwapCounter,
-    KeeperRandomSeed,
-    InsuranceVaultBalance,
-    InsuranceTargetReserve,
-    VdfProofCounter,
-    VdfProofs(u64),
-    /// Per-block execution counter for rate limiting (Issue #831)
-    BlockExecutionCount,
-    /// Cumulative user execution count for fee discount tiers (Issue #826)
-    UserExecutionCount(Address),
-    /// Last ledger sequence number tracked for rate limiting
-    LastBlockLedger,
-    /// Maximum tasks per block configuration
-    MaxTasksPerBlock,
-    /// Invalidation hook storage (Issue #832)
-    InvalidationHookCounter,
-    InvalidationHooks(u64),
-    /// Encrypted payload storage (Issue #833)
-    EncryptedPayload(u64),
-    /// Delegation pool storage (Issue #836)
-    DelegationPool(Address),
-    DelegationPoolCounter,
-    /// Keeper commission rate in basis points
-    KeeperCommission(Address),
-    /// List of delegator addresses for a given keeper
-    KeeperDelegators(Address),
-    /// Total delegated amount for a given keeper
-    KeeperTotalDelegated(Address),
-    BundleCounter,
-    BundleExecution(u64),
-    /// Multi-oracle price feeds (Issue #1041)
-    OracleFeed(OracleProvider),
-    OracleFeedCount,
-    /// VRF commit-reveal storage (Issue #1042)
-    VrfCommit(u64),
-    /// Keeper economic bond storage (Issue #1043)
-    KeeperBond(Address),
-    /// Whitelist of keepers allowed to claim restricted tasks
-    RestrictedTaskKeepers,
-    /// Whether a task requires bonded keepers (Issue #1043)
-    TaskRequiresBond(u64),
-    /// Configurable VRF delay in seconds (Issue #1042)
-    VrfDelaySeconds,
-    /// Configurable VRF expiration in seconds (Issue #1042)
-    VrfExpirationSeconds,
-    TotalTaskEscrows,
-    TotalKeeperStakes,
-    TotalUnclaimedFees,
-    /// Cross-chain gateway: relayer address authorized to relay messages
-    CrossChainGatewayRelayer,
-    /// Cross-chain gateway: per-chain nonce tracking (replay protection)
-    CrossChainNonce(u32, u64),
-    /// Cross-chain gateway: per-chain nonce counter
-    CrossChainNonceCounter(u32),
-    /// Cross-chain gateway: received task records
-    CrossChainTaskRecord(u64),
-    /// Cross-chain gateway: global received task counter
-    CrossChainTaskCounter,
-    /// Cross-chain gateway: per-chain enabled flag
-    CrossChainSourceEnabled(u32),
-    // -------------------------------------------------------------------------
-    // Groth16 ZK proof gate (Issue #1195)
-    // -------------------------------------------------------------------------
-    /// Stored 32-byte verification-key digest `SHA-256(α||β||γ||δ||IC)`.
-    ZkVerificationKey,
-    /// Spent-nullifier set; key = nullifier bytes, value = bool (true = spent).
-    ZkNullifier(BytesN<32>),
-    /// Sequential ZK proof record (audit log).
-    ZkProofRecord(u64),
-    /// Counter for ZK proof records.
-    ZkProofCounter,
-}
-
-/// Transient storage reentrancy guard ensuring reentrant calls revert immediately.
-pub struct ReentrancyGuard<'a>(&'a Env);
-
-impl<'a> ReentrancyGuard<'a> {
-    pub fn new(env: &'a Env) -> Self {
-        enter_security_guard(env);
-        Self(env)
-    }
-}
-
-impl<'a> Drop for ReentrancyGuard<'a> {
-    fn drop(&mut self) {
-        exit_security_guard(self.0);
-    }
+pub mod resolver;
+pub mod mempool;
+pub mod ccip;
+pub mod admin;
+pub mod security;
+#[cfg(test)]
+mod test_commit_reveal;
 }
 
 fn enter_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    if env.storage().temporary().has(&key) || env.storage().instance().has(&key) {
-        panic_with_error!(env, Error::ReentrantCall);
-    }
-    env.storage().temporary().set(&key, &true);
-    env.storage().instance().set(&key, &true);
+    security::enter(env);
 }
 
 fn exit_security_guard(env: &Env) {
-    let key = DataKey::ReentrancyLock;
-    env.storage().temporary().remove(&key);
-    env.storage().instance().remove(&key);
+    security::exit(env);
 }
 
 /// Deterministic fingerprint for a task's identifying parameters, scoped per
@@ -4795,9 +3611,25 @@ impl SoroTaskContract {
     }
 
     pub fn execute(env: Env, keeper: Address, task_id: u64) {
-        enter_security_guard(&env);
+        // SC-HARD-07: Direct execution is only allowed when the caller has
+        // already posted a valid commitment via commit_execution(). This
+        // prevents mempool frontrunning by ensuring every execution was
+        // preceded by a private preimage commitment.
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        if !env.storage().persistent().has(&commitment_key) {
+            panic_with_error!(&env, Error::CommitmentRequired);
+        }
+        // Verify that the commitment belongs to this keeper
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentRequired));
+        if commitment.keeper != keeper {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        let _guard = security::ReentrancyGuard::new(&env);
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
     }
 
     /// Public permissionless entrypoint to bump task TTL with keeper incentive (Issue #1031)
@@ -4874,6 +3706,7 @@ impl SoroTaskContract {
         callback_fn: Symbol,
         callback_args: Vec<Val>,
     ) {
+        let _guard = security::ReentrancyGuard::new(&env);
         keeper.require_auth();
         extend_instance_ttl(&env);
         let task_key = DataKey::Task(task_id);
@@ -4898,9 +3731,7 @@ impl SoroTaskContract {
         }
 
         // Execute inner task execution atomically
-        enter_security_guard(&env);
         Self::execute_internal(&env, &keeper, task_id, true);
-        exit_security_guard(&env);
     }
 
     /// Verifies VDF proof difficulty and non-empty output integrity, ensuring un-cheatable
@@ -4917,12 +3748,11 @@ impl SoroTaskContract {
 
     /// Executes task after validating Verifiable Delay Function (VDF) proof.
     pub fn execute_with_vdf(env: Env, keeper: Address, task_id: u64, vdf_proof: VdfProof) -> bool {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         if !Self::verify_vdf_proof(env.clone(), vdf_proof, 100) {
             panic_with_error!(&env, Error::InvalidVdfProof);
         }
         Self::execute_internal(&env, &keeper, task_id, false);
-        exit_security_guard(&env);
         true
     }
 
@@ -5920,7 +4750,7 @@ impl SoroTaskContract {
     /// Withdraws gas tokens from a task's balance.
     /// Only the task creator can withdraw.
     pub fn withdraw_gas(env: Env, task_id: u64, amount: i128) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let task_key = DataKey::Task(task_id);
         let mut config: TaskConfig = env
             .storage()
@@ -5961,12 +4791,11 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Cancels a task, refunds remaining gas, and removes it from storage.
     pub fn cancel_task(env: Env, task_id: u64) {
-        enter_security_guard(&env);
+        let _guard = security::ReentrancyGuard::new(&env);
         let config: TaskConfig = load_task(&env, task_id).expect("Task not found");
 
         // Validate: Only creator can cancel
@@ -6027,7 +4856,6 @@ impl SoroTaskContract {
             ),
             (config.creator.clone(), refund_amount),
         );
-        exit_security_guard(&env);
     }
 
     /// Permissionlessly refunds and removes an abandoned task (Issue #777).
@@ -9261,6 +8089,145 @@ impl SoroTaskContract {
         crate::zk::execute_zk(&env, task_id, proof);
         exit_security_guard(&env);
     }
+
+    // ─── Commit-Reveal Anti-Frontrunning Protocol (SC-HARD-07) ──────────────
+
+    /// Phase 1 – Commit. Keeper posts a hash commitment before executing.
+    /// `bond_amount` is debited from `DataKey::KeeperStake(keeper)`.
+    pub fn commit_execution(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        commitment_hash: BytesN<32>,
+        bond_amount: i128,
+    ) {
+        keeper.require_auth();
+
+        if bond_amount < MIN_COMMIT_BOND {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        if env.storage().persistent().has(&commitment_key) {
+            panic_with_error!(&env, Error::CommitmentAlreadyExists);
+        }
+
+        if !env.storage().persistent().has(&DataKey::Task(task_id)) {
+            panic_with_error!(&env, Error::TaskNotFound);
+        }
+
+        let stake_key = DataKey::KeeperStake(keeper.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0i128);
+        if current_stake < bond_amount {
+            panic_with_error!(&env, Error::InsufficientBalance);
+        }
+        env.storage().persistent().set(&stake_key, &(current_stake - bond_amount));
+
+        let commit_ledger = env.ledger().sequence();
+        let commitment = ExecutionCommitment {
+            keeper: keeper.clone(),
+            task_id,
+            commitment_hash: commitment_hash.clone(),
+            commit_ledger,
+            bond_amount,
+        };
+        env.storage().persistent().set(&commitment_key, &commitment);
+        env.storage().persistent().extend_ttl(&commitment_key, 100, 100);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExecutionCommitted"), Symbol::new(&env, "v1"), task_id),
+            (keeper, commitment_hash, commit_ledger),
+        );
+    }
+
+    /// Phase 2 – Reveal. Verifies the preimage, refunds bond, and executes.
+    pub fn reveal_execution(
+        env: Env,
+        keeper: Address,
+        task_id: u64,
+        secret: Bytes,
+        block_target: u32,
+    ) {
+        keeper.require_auth();
+
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+
+        if commitment.keeper != keeper {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+
+        let current_ledger = env.ledger().sequence();
+        if !crate::mempool::is_within_reveal_window(
+            current_ledger,
+            commitment.commit_ledger,
+            COMMIT_REVEAL_WINDOW_LEDGERS,
+        ) {
+            panic_with_error!(&env, Error::RevealWindowExpired);
+        }
+
+        let valid = crate::mempool::verify_commitment(
+            &env, &keeper, task_id, &secret, block_target, &commitment.commitment_hash,
+        );
+        if !valid {
+            panic_with_error!(&env, Error::CommitmentMismatch);
+        }
+
+        // Refund bond
+        let stake_key = DataKey::KeeperStake(keeper.clone());
+        let current_stake: i128 = env.storage().persistent().get(&stake_key).unwrap_or(0i128);
+        env.storage().persistent().set(&stake_key, &(current_stake + commitment.bond_amount));
+
+        env.storage().persistent().remove(&commitment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "ExecutionRevealed"), Symbol::new(&env, "v1"), task_id),
+            (keeper.clone(), current_ledger),
+        );
+
+        // Call execute_internal directly — the commitment was already verified and removed above,
+        // so we skip the commitment gate (skip_auth=true bypasses keeper.require_auth() as well
+        // since we already called keeper.require_auth() at the top of reveal_execution).
+        enter_security_guard(&env);
+        Self::execute_internal(&env, &keeper, task_id, true);
+        exit_security_guard(&env);
+    }
+
+    /// Forfeit an expired commitment (callable by anyone after window closes).
+    pub fn forfeit_expired_commitment(env: Env, task_id: u64) {
+        let commitment_key = DataKey::ExecutionCommitment(task_id);
+        let commitment: ExecutionCommitment = env
+            .storage()
+            .persistent()
+            .get(&commitment_key)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::CommitmentNotFound));
+
+        let current_ledger = env.ledger().sequence();
+        // Reject forfeit attempt while the reveal window is still open
+        if crate::mempool::is_within_reveal_window(
+            current_ledger,
+            commitment.commit_ledger,
+            COMMIT_REVEAL_WINDOW_LEDGERS,
+        ) {
+            panic_with_error!(&env, Error::ChallengeWindowActive);
+        }
+
+        let vault_key = DataKey::InsuranceVaultBalance;
+        let vault: i128 = env.storage().persistent().get(&vault_key).unwrap_or(0i128);
+        env.storage().persistent().set(&vault_key, &(vault + commitment.bond_amount));
+        env.storage().persistent().remove(&commitment_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "CommitmentForfeited"), Symbol::new(&env, "v1"), task_id),
+            (commitment.keeper, commitment.bond_amount, current_ledger),
+        );
+    }
+}
+    }
 }
 
 // ============================================================================
@@ -9314,6 +8281,26 @@ pub(crate) mod tests {
         pub fn reenter_pause(env: Env, contract_id: Address, task_id: u64) {
             let client = SoroTaskContractClient::new(&env, &contract_id);
             client.pause_task(&task_id);
+        }
+    }
+
+    /// Target that attempts to cancel another task during its callback.
+    #[contract]
+    pub struct ReentrantTarget;
+
+    #[contractimpl]
+    impl ReentrantTarget {
+        pub fn attempt_cancel(env: Env, contract_id: Address, task_id: u64) {
+            let client = SoroTaskContractClient::new(&env, &contract_id);
+            let rejected = client.try_cancel_task(&task_id).is_err();
+            env.storage().instance().set(&Symbol::new(&env, "reentry_rejected"), &rejected);
+        }
+
+        pub fn was_reentry_rejected(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "reentry_rejected"))
+                .unwrap_or(false)
         }
     }
 
@@ -10109,6 +9096,38 @@ pub(crate) mod tests {
         assert_eq!(stored.target, target);
         assert_eq!(stored.interval, 3_600);
         assert_eq!(stored.last_run, 0, "last_run must start at 0");
+    }
+
+    /// Reentry from an untrusted task callback is rejected while the outer
+    /// execution and ordinary target invocation complete successfully.
+    #[test]
+    fn test_malicious_target_cannot_reenter_cancel_task() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+        let keeper = Address::generate(&env);
+
+        let victim_target = env.register(MockTarget, ());
+        let victim_id = client.register(&base_config(&env, victim_target));
+
+        let attacker_target = env.register(ReentrantTarget, ());
+        let mut attacker_config = base_config(&env, attacker_target.clone());
+        attacker_config.function = Symbol::new(&env, "attempt_cancel");
+        attacker_config.args = vec![
+            &env,
+            id.clone().into_val(&env),
+            victim_id.into_val(&env),
+        ];
+        let attacker_id = client.register(&attacker_config);
+
+        set_timestamp(&env, 10_000);
+        client.execute(&keeper, &attacker_id);
+
+        let attacker_client = ReentrantTargetClient::new(&env, &attacker_target);
+        assert!(attacker_client.was_reentry_rejected());
+        assert!(client.get_task(&victim_id).is_some());
+
+        // A subsequent ordinary call remains possible after the guard drops.
+        client.execute(&keeper, &victim_id);
     }
 
     /// Querying a task id that was never registered returns None.

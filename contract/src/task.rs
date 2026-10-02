@@ -2,6 +2,7 @@
 
 use soroban_sdk::Env;
 
+use crate::events::{self, Action};
 use crate::storage::{self, TaskMeta, TaskPayload};
 use crate::TaskConfig;
 
@@ -26,6 +27,7 @@ pub fn get_config(env: &Env, task_id: u64) -> Option<TaskConfig> {
 
 pub fn persist_config(env: &Env, task_id: u64, config: &TaskConfig) {
     storage::save_task_split(env, task_id, config);
+    events::emit_task_event(env, Action::ConfigPersisted, task_id, config);
 }
 
 pub fn update_meta<F>(env: &Env, task_id: u64, f: F) -> Option<TaskMeta>
@@ -35,5 +37,6 @@ where
     let mut meta = storage::load_task_meta(env, task_id)?;
     f(&mut meta);
     storage::save_task_meta(env, task_id, &meta);
+    events::emit_meta_event(env, Action::MetaUpdated, task_id, &meta);
     Some(meta)
 }
