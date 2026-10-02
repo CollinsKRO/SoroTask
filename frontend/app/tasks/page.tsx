@@ -1,13 +1,20 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useEffect, useMemo, useRef, Suspense } from "react";
 import { useTasks } from "@/src/hooks/tasks";
 import { useLayoutStore } from "@/src/store/layoutStore";
 import SplitPaneLayout from "@/src/components/layout/SplitPaneLayout";
-import TaskCardWithSelection from "@/components/TaskCardWithSelection";
+import TaskSelectableCard from "@/app/tasks/bulk/TaskSelectableCard";
+import BulkSelectAllBar from "@/app/tasks/bulk/BulkSelectAllBar";
+import BatchActionConsole from "@/app/tasks/bulk/BatchActionConsole";
+import { useTaskBulkSelection } from "@/app/tasks/bulk/bulkSelectionStore";
 import TaskSimulationWorkbench from "@/components/TaskSimulationWorkbench";
 import type { TaskFilters } from "@/src/lib/query/keys";
-import { createPerformanceMonitor, afterNextPaint } from "@/src/lib/frontend-performance";
+import {
+  createPerformanceMonitor,
+  afterNextPaint,
+} from "@/src/lib/frontend-performance";
 
 const TASKS_PER_PAGE = 10;
 const monitor = createPerformanceMonitor({ route: "/tasks" });
@@ -20,10 +27,12 @@ function TasksPageContent() {
   const { listScrollPosition, saveListScrollPosition } = useLayoutStore();
   const listRef = useRef<HTMLDivElement>(null);
   const finishRouteLoad = useRef(monitor.start("route_load"));
+  const selectedIds = useTaskBulkSelection((state) => state.selectedIds);
 
   const totalTasks = tasks?.length ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalTasks / TASKS_PER_PAGE));
-  const pageStart = totalTasks === 0 ? 0 : (currentPage - 1) * TASKS_PER_PAGE + 1;
+  const pageStart =
+    totalTasks === 0 ? 0 : (currentPage - 1) * TASKS_PER_PAGE + 1;
   const pageEnd = Math.min(currentPage * TASKS_PER_PAGE, totalTasks);
   const paginatedTasks = useMemo(() => {
     if (!tasks) return [];
@@ -38,10 +47,10 @@ function TasksPageContent() {
     if (listRef.current && listScrollPosition > 0) {
       listRef.current.scrollTop = listScrollPosition;
     }
-    
+
     // Load saved templates
     try {
-      const stored = window.localStorage.getItem('sorotask.templates');
+      const stored = window.localStorage.getItem("sorotask.templates");
       if (stored) {
         setSavedTemplates(JSON.parse(stored));
       }
@@ -88,7 +97,7 @@ function TasksPageContent() {
         {/* Header */}
         <div className="px-6 py-4 border-b border-neutral-700 flex-shrink-0">
           <h1 className="text-2xl font-bold text-neutral-100 mb-2">Tasks</h1>
-          
+
           {/* Filters */}
           <div className="flex gap-3 items-center">
             <select
@@ -96,7 +105,7 @@ function TasksPageContent() {
               onChange={(e) =>
                 updateFilters((prev) => ({
                   ...prev,
-                  status: e.target.value as any || undefined,
+                  status: (e.target.value as any) || undefined,
                 }))
               }
               className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-200"
@@ -113,10 +122,29 @@ function TasksPageContent() {
               placeholder="Search tasks..."
               value={filters.search || ""}
               onChange={(e) =>
-                updateFilters((prev) => ({ ...prev, search: e.target.value || undefined }))
+                updateFilters((prev) => ({
+                  ...prev,
+                  search: e.target.value || undefined,
+                }))
               }
               className="bg-neutral-900 border border-neutral-700 rounded-lg px-3 py-2 text-sm text-neutral-200 flex-1 max-w-md"
             />
+          </div>
+
+          {/* Batch multi-select (#1265) */}
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-neutral-700/50 bg-neutral-900/40 px-3 py-2">
+            <BulkSelectAllBar
+              pageTaskIds={paginatedTasks.map((task: any) => String(task.id))}
+              totalResults={totalTasks}
+            />
+            {selectedIds.length > 0 && (
+              <Link
+                href="/tasks/bulk"
+                className="inline-flex items-center gap-1 text-sm font-medium text-primary-400 hover:text-primary-300 hover:underline"
+              >
+                Open batch console ({selectedIds.length})
+              </Link>
+            )}
           </div>
         </div>
 
@@ -128,11 +156,29 @@ function TasksPageContent() {
         >
           {savedTemplates.length > 0 && (
             <div className="mb-8">
-              <h2 className="text-xl font-bold text-neutral-200 mb-4">Saved Templates</h2>
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-xl font-bold text-neutral-200">
+                  Saved Templates
+                </h2>
+                <Link
+                  href="/marketplace/templates"
+                  className="text-sm text-blue-400 hover:text-blue-300 hover:underline"
+                >
+                  Browse the template marketplace
+                </Link>
+              </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                 {savedTemplates.map((template, idx) => (
-                  <div key={idx} className="bg-neutral-900 border border-neutral-700 rounded-xl p-4 flex flex-col gap-2">
-                    <h3 className="font-semibold text-emerald-400">{template.name}</h3>
+                  // Forks from the marketplace carry a stable, unique id; older
+                  // entries persisted before that may not, so fall back to the
+                  // index rather than keying everything on `undefined`.
+                  <div
+                    key={template.id ?? idx}
+                    className="bg-neutral-900 border border-neutral-700 rounded-xl p-4 flex flex-col gap-2"
+                  >
+                    <h3 className="font-semibold text-emerald-400">
+                      {template.name}
+                    </h3>
                     <p className="text-sm text-neutral-400 truncate">
                       {template.description || "No description provided."}
                     </p>
@@ -145,7 +191,9 @@ function TasksPageContent() {
             </div>
           )}
 
-          <h2 className="text-xl font-bold text-neutral-200 mb-4">Active Tasks</h2>
+          <h2 className="text-xl font-bold text-neutral-200 mb-4">
+            Active Tasks
+          </h2>
 
           {isLoading && (
             <div className="space-y-4">
@@ -167,8 +215,9 @@ function TasksPageContent() {
           {!isLoading && tasks && tasks.length > 0 && (
             <div className="space-y-4">
               {paginatedTasks.map((task: any) => (
-                <TaskCardWithSelection key={task.id} task={task} />
+                <TaskSelectableCard key={task.id} task={task} />
               ))}
+              <BatchActionConsole tasks={tasks} />
             </div>
           )}
         </div>
@@ -212,7 +261,13 @@ function TasksPageContent() {
 
 export default function TasksPage() {
   return (
-    <Suspense fallback={<div className="h-full flex items-center justify-center text-neutral-400">Loading Tasks...</div>}>
+    <Suspense
+      fallback={
+        <div className="h-full flex items-center justify-center text-neutral-400">
+          Loading Tasks...
+        </div>
+      }
+    >
       <TasksPageContent />
     </Suspense>
   );

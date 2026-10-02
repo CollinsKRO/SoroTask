@@ -24,6 +24,9 @@ const {
 } = require("./graphql/db");
 const { WebhookDispatcher } = require("./webhooks/dispatcher");
 const { ParallelLedgerParser } = require("./parallelParser");
+const { CacheInvalidationEngine } = require("./cacheInvalidator");
+const { LedgerGapDetector } = require("./ledgerGapDetector");
+const { HighAvailabilityManager } = require("./ha");
 
 // Configuration
 const RPC_URL = "https://soroban-testnet.stellar.org"; // Change as needed
@@ -661,7 +664,7 @@ if (!handleCLI()) {
     db,
     rpc,
     contractId: CONTRACT_ID,
-    intervalMs: Number(process.env.SYNTHETIC_INTERVAL_MS || 60_000),
+    intervalMs: Number(process.env.SYNTHETIC_INTERVAL_MS || 10 * 60_000),
     latencyThresholdMs: Number(process.env.SYNTHETIC_LATENCY_THRESHOLD_MS || 30_000),
     timeoutMs: Number(process.env.SYNTHETIC_TIMEOUT_MS || 120_000),
     webhookUrl: process.env.SYNTHETIC_MONITOR_WEBHOOK_URL || null,
