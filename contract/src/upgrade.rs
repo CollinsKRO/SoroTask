@@ -1,6 +1,6 @@
 //! Timelocked contract upgrade workflow with storage schema migrations.
 
-use soroban_sdk::{Address, BytesN, Env, Symbol, panic_with_error};
+use soroban_sdk::{panic_with_error, Address, BytesN, Env, Symbol};
 
 use crate::admin::{require_proxy_admin, set_proxy_config};
 use crate::storage::{self, STORAGE_SCHEMA_VERSION};
@@ -61,10 +61,7 @@ pub fn propose_upgrade(
         .set(&DataKey::UpgradeProposal, &proposal);
 
     env.events().publish(
-        (
-            Symbol::new(env, "UpgradeProposed"),
-            Symbol::new(env, "v1"),
-        ),
+        (Symbol::new(env, "UpgradeProposed"), Symbol::new(env, "v1")),
         (admin.clone(), new_version, proposal.execute_after),
     );
 }
@@ -103,7 +100,11 @@ pub fn execute_upgrade(env: &Env, admin: &Address) {
     let old_version = config.version;
     let new_version = proposal.new_version;
 
-    migrate_storage(env, old_version, proposal.migration_version.max(STORAGE_SCHEMA_VERSION));
+    migrate_storage(
+        env,
+        old_version,
+        proposal.migration_version.max(STORAGE_SCHEMA_VERSION),
+    );
 
     let upgrade_id = config.upgrade_count.saturating_add(1);
     let record = UpgradeRecord {
@@ -145,10 +146,7 @@ pub fn cancel_upgrade(env: &Env, admin: &Address) {
     }
     clear_proposal(env);
     env.events().publish(
-        (
-            Symbol::new(env, "UpgradeCancelled"),
-            Symbol::new(env, "v1"),
-        ),
+        (Symbol::new(env, "UpgradeCancelled"), Symbol::new(env, "v1")),
         admin.clone(),
     );
 }
